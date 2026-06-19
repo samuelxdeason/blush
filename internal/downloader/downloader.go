@@ -5,9 +5,13 @@ package downloader
 import (
 	"bufio"
 	"encoding/json"
+	"hash/fnv"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -258,6 +262,8 @@ func (d *Downloader) run(j *Job) {
 		"--ignore-config",
 		"-f", "bestvideo+bestaudio/best",
 		"--merge-output-format", "mp4",
+		"--postprocessor-args", "Merger:-movflags +faststart", // moov at front → instant seek
+
 		"-o", outtmpl,
 		"--download-archive", cfg.Archive,
 		"--write-info-json",
@@ -399,6 +405,12 @@ func (d *Downloader) ingest(filepathStr string) (library.Video, bool) {
 	}
 
 	uploader := firstNonEmpty(info.Uploader, info.UploaderID, info.Channel)
+	// Pornhub's uploader is reliably the performer, so default the model to it.
+	// X/Twitter is a repost firehose, so leave it Unassigned for manual sorting.
+	var models []string
+	if info.ExtractorKey != "Twitter" && uploader != "" {
+		models = []string{uploader}
+	}
 	thumb := findThumb(stem)
 	if thumb == "" {
 		thumb = d.makeThumb(filepathStr, stem, info.Duration) // ffmpeg fallback
@@ -408,6 +420,7 @@ func (d *Downloader) ingest(filepathStr string) (library.Video, bool) {
 		Site:         info.ExtractorKey,
 		Title:        firstNonEmpty(info.Title, uploader),
 		Uploader:     uploader,
+		Models:       models,
 		Width:        info.Width,
 		Height:       info.Height,
 		Ext:          strings.TrimPrefix(filepath.Ext(filepathStr), "."),
@@ -472,6 +485,252 @@ func (d *Downloader) makeThumb(video, stem string, dur *float64) string {
 		return out
 	}
 	return ""
+}
+
+// ---- importing local files --------------------------------------------
+
+var videoExts = map[string]bool{
+	".mp4": true, ".mkv": true, ".webm": true, ".mov": true, ".m4v": true, ".avi": true, ".ts": true,
+}
+
+var imageExts = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".webp": true, ".gif": true, ".bmp": true,
+}
+
+var (
+	reRes   = regexp.MustCompile(`(?i)[_-]\d{3,4}p$`)
+	reHash  = regexp.MustCompile(`(?i)[-_][0-9a-f]{6,12}$`)
+	reSpace = regexp.MustCompile(`\s+`)
+)
+
+// cleanTitle turns a download-site filename into a readable title.
+func cleanTitle(filename string) string {
+	stem := strings.TrimSuffix(filename, filepath.Ext(filename))
+	stem = reRes.ReplaceAllString(stem, "")  // drop trailing _720p / -1080p
+	stem = reHash.ReplaceAllString(stem, "") // drop trailing -3c7bd96 hash
+	stem = strings.NewReplacer("-", " ", "_", " ", ".", " ").Replace(stem)
+	stem = strings.TrimSpace(reSpace.ReplaceAllString(stem, " "))
+	words := strings.Fields(stem)
+	for i, w := range words {
+		words[i] = strings.ToUpper(w[:1]) + w[1:]
+	}
+	t := strings.Join(words, " ")
+	if t == "" {
+		return filename
+	}
+	return t
+}
+
+func sanitizeName(s string) string {
+	s = strings.TrimSpace(s)
+	for _, ch := range `<>:"/\|?*` {
+		s = strings.ReplaceAll(s, string(ch), "_")
+	}
+	return s
+}
+
+func hashStr(s string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(strings.ToLower(s)))
+	return strconv.FormatUint(uint64(h.Sum32()), 16)
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	cerr := out.Close()
+	if err != nil {
+		return err
+	}
+	return cerr
+}
+
+func (d *Downloader) ffprobeInfo(path string) (dur, w, h *int) {
+	ff := "ffprobe"
+	if d.cfg.FfmpegDir != "" {
+		ff = filepath.Join(d.cfg.FfmpegDir, "ffprobe.exe")
+	}
+	cmd := exec.Command(ff, "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=width,height:format=duration", "-of", "json", path)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, nil, nil
+	}
+	var probe struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	if json.Unmarshal(out, &probe) != nil {
+		return nil, nil, nil
+	}
+	if len(probe.Streams) > 0 {
+		wv, hv := probe.Streams[0].Width, probe.Streams[0].Height
+		if wv > 0 {
+			w = &wv
+		}
+		if hv > 0 {
+			h = &hv
+		}
+	}
+	if f, e := strconv.ParseFloat(probe.Format.Duration, 64); e == nil && f > 0 {
+		di := int(f)
+		dur = &di
+	}
+	return dur, w, h
+}
+
+// Import copies/catalogues local video files (and folders) into the library
+// under the given model. Folders default the model to the folder name.
+func (d *Downloader) Import(paths []string, model string) {
+	go d.importWork(paths, model)
+}
+
+func (d *Downloader) importWork(paths []string, model string) {
+	type task struct{ path, model, kind string }
+	var tasks []task
+	add := func(fp, m string) {
+		ext := strings.ToLower(filepath.Ext(fp))
+		if videoExts[ext] {
+			tasks = append(tasks, task{fp, m, "video"})
+		} else if imageExts[ext] {
+			tasks = append(tasks, task{fp, m, "photo"})
+		}
+	}
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if fi.IsDir() {
+			m := model
+			if strings.TrimSpace(m) == "" {
+				m = filepath.Base(p) // a dropped folder names the model
+			}
+			_ = filepath.WalkDir(p, func(fp string, e fs.DirEntry, err error) error {
+				if err == nil && !e.IsDir() {
+					add(fp, m)
+				}
+				return nil
+			})
+		} else {
+			add(p, model)
+		}
+	}
+	total := len(tasks)
+	added := 0
+	for i, t := range tasks {
+		ok := false
+		if t.kind == "video" {
+			ok = d.importOne(t.path, t.model)
+		} else {
+			ok = d.importPhotoOne(t.path, t.model)
+		}
+		if ok {
+			added++
+		}
+		d.emit("import", map[string]any{"done": i + 1, "total": total, "name": filepath.Base(t.path)})
+	}
+	d.emit("import", map[string]any{"done": total, "total": total, "added": added, "finished": true})
+}
+
+func (d *Downloader) importPhotoOne(src, model string) bool {
+	base := filepath.Base(src)
+	folder := model
+	if strings.TrimSpace(folder) == "" {
+		folder = "Unassigned"
+	}
+	destDir := filepath.Join(d.cfg.MediaRoot, "Local", sanitizeName(folder), "photos")
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return false
+	}
+	dest := filepath.Join(destDir, base)
+	if !strings.EqualFold(src, dest) {
+		if _, err := os.Stat(dest); err != nil {
+			if copyFile(src, dest) != nil {
+				return false
+			}
+		}
+	} else {
+		dest = src
+	}
+	return d.db.AddPhoto(library.Photo{
+		ID:       "photo_" + hashStr(dest),
+		Model:    model,
+		Filepath: dest,
+		Filename: base,
+		Added:    time.Now().Format("2006-01-02 15:04:05"),
+	}) == nil
+}
+
+func (d *Downloader) importOne(src, model string) bool {
+	base := filepath.Base(src)
+	folder := model
+	if strings.TrimSpace(folder) == "" {
+		folder = "Unassigned"
+	}
+	destDir := filepath.Join(d.cfg.MediaRoot, "Local", sanitizeName(folder))
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return false
+	}
+	dest := filepath.Join(destDir, base)
+	if !strings.EqualFold(src, dest) {
+		if _, err := os.Stat(dest); err != nil { // don't recopy if already there
+			if copyFile(src, dest) != nil {
+				return false
+			}
+		}
+	} else {
+		dest = src
+	}
+
+	dur, w, h := d.ffprobeInfo(dest)
+	stem := strings.TrimSuffix(dest, filepath.Ext(dest))
+	thumb := findThumb(stem)
+	if thumb == "" {
+		var df *float64
+		if dur != nil {
+			f := float64(*dur)
+			df = &f
+		}
+		thumb = d.makeThumb(dest, stem, df)
+	}
+	var size *int64
+	if st, err := os.Stat(dest); err == nil {
+		s := st.Size()
+		size = &s
+	}
+	var models []string
+	if strings.TrimSpace(model) != "" {
+		models = []string{model}
+	}
+	v := library.Video{
+		ID:       "local_" + hashStr(dest),
+		Site:     "Local",
+		Title:    cleanTitle(base),
+		Uploader: model,
+		Models:   models,
+		Duration: dur, Width: w, Height: h,
+		Ext:      strings.TrimPrefix(filepath.Ext(dest), "."),
+		Filepath: dest, Filename: base,
+		Thumbnail: thumb,
+		Filesize:  size,
+		Added:     time.Now().Format("2006-01-02 15:04:05"),
+	}
+	return d.db.Upsert(v) == nil
 }
 
 func firstNonEmpty(vals ...string) string {

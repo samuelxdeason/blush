@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -118,6 +119,7 @@ type App struct {
 	db        *library.DB
 	dl        *downloader.Downloader
 	mediaRoot string
+	mediaPort int
 }
 
 func NewApp() *App { return &App{mediaRoot: loadConfig().MediaRoot} }
@@ -155,6 +157,7 @@ func (a *App) Stats() (library.Stats, error) { return a.db.Stats() }
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	_ = os.MkdirAll(a.mediaRoot, 0o755)
+	a.startMediaServer()
 
 	db, err := library.Open(filepath.Join(a.mediaRoot, "library.db"), a.mediaRoot)
 	if err != nil {
@@ -186,6 +189,12 @@ func (a *App) startup(ctx context.Context) {
 	if _, err := os.Stat(a.cookiesPath()); err == nil {
 		a.dl.SetCookieSpec("file:" + a.cookiesPath())
 	}
+
+	// Drag-and-drop: forward dropped file/folder paths to the UI, which decides
+	// the target model and calls Import.
+	runtime.OnFileDrop(ctx, func(_, _ int, paths []string) {
+		runtime.EventsEmit(ctx, "filedrop", paths)
+	})
 }
 
 func (a *App) cookiesPath() string { return filepath.Join(a.mediaRoot, "cookies.txt") }
@@ -268,9 +277,80 @@ func (a *App) RemoveJob(id string)       { a.dl.RemoveJob(id) }
 func (a *App) ClearFinished()            { a.dl.ClearFinished() }
 func (a *App) SetCookieSpec(spec string) { a.dl.SetCookieSpec(spec) }
 
-func (a *App) Models() ([]library.Model, error)                      { return a.db.Models() }
-func (a *App) Videos(site, uploader string) ([]library.Video, error) { return a.db.Videos(site, uploader) }
-func (a *App) VideosBySite(site string) ([]library.Video, error)     { return a.db.VideosBySite(site) }
+func (a *App) Models() ([]library.Model, error)                  { return a.db.Models() }
+func (a *App) VideosByModel(model string) ([]library.Video, error) { return a.db.VideosByModel(model) }
+func (a *App) VideosBySite(site string) ([]library.Video, error)  { return a.db.VideosBySite(site) }
+
+// SetModels reassigns a video's model set ([] = Unassigned).
+func (a *App) SetModels(site, id string, models []string) error { return a.db.SetModels(site, id, models) }
+
+// SetTitle renames a video.
+func (a *App) SetTitle(site, id, title string) error { return a.db.SetTitle(site, id, title) }
+
+// SetFavorite likes/unlikes a video.
+func (a *App) SetFavorite(site, id string, fav bool) error { return a.db.SetFavorite(site, id, fav) }
+
+// SetLabels sets a video's categories.
+func (a *App) SetLabels(site, id string, labels []string) error { return a.db.SetLabels(site, id, labels) }
+
+// AllLabels returns every category in use (for autocomplete).
+func (a *App) AllLabels() ([]string, error) { return a.db.AllLabels() }
+
+// LabelCounts returns every category with its video count.
+func (a *App) LabelCounts() ([]library.LabelCount, error) { return a.db.LabelCounts() }
+
+// VideosByLabel returns videos tagged with a category.
+func (a *App) VideosByLabel(label string) ([]library.Video, error) { return a.db.VideosByLabel(label) }
+
+// Favorites returns liked videos.
+func (a *App) Favorites() ([]library.Video, error) { return a.db.Favorites() }
+
+// Import copies local video files/folders into the library under model.
+func (a *App) Import(paths []string, model string) { a.dl.Import(paths, model) }
+
+// ImportFilesDialog opens a multi-file picker and imports the chosen videos.
+func (a *App) ImportFilesDialog(model string) {
+	paths, err := runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:   "Choose videos to import",
+		Filters: []runtime.FileFilter{{DisplayName: "Videos", Pattern: "*.mp4;*.mkv;*.webm;*.mov;*.m4v;*.avi;*.ts"}},
+	})
+	if err == nil && len(paths) > 0 {
+		a.dl.Import(paths, model)
+	}
+}
+
+// ImportFolderDialog opens a folder picker; the folder name becomes the model.
+func (a *App) ImportFolderDialog() {
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{Title: "Choose a folder of videos to import"})
+	if err == nil && dir != "" {
+		a.dl.Import([]string{dir}, "")
+	}
+}
+
+// PhotosByModel returns a model's photos.
+func (a *App) PhotosByModel(model string) ([]library.Photo, error) { return a.db.PhotosByModel(model) }
+
+// GetModelInfo returns a model's profile (bio, links, cover).
+func (a *App) GetModelInfo(name string) (library.ModelInfo, error) { return a.db.GetModelInfo(name) }
+
+// SaveModelInfo saves a model's bio + links.
+func (a *App) SaveModelInfo(name, bio string, links []library.ModelLink) error {
+	return a.db.SaveModelInfo(name, bio, links)
+}
+
+// SetModelCover sets a model's cover image (absolute path to a photo).
+func (a *App) SetModelCover(name, cover string) error { return a.db.SetModelCover(name, cover) }
+
+// ImportPhotosDialog opens an image picker and attaches the chosen photos to model.
+func (a *App) ImportPhotosDialog(model string) {
+	paths, err := runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:   "Choose photos to add",
+		Filters: []runtime.FileFilter{{DisplayName: "Images", Pattern: "*.jpg;*.jpeg;*.png;*.webp;*.gif;*.bmp"}},
+	})
+	if err == nil && len(paths) > 0 {
+		a.dl.Import(paths, model)
+	}
+}
 func (a *App) Search(q string) ([]library.Video, error)              { return a.db.Search(q) }
 func (a *App) RecentlyDownloaded() ([]library.Video, error)          { return a.db.RecentlyDownloaded(200) }
 func (a *App) RecentlyWatched() ([]library.Video, error)             { return a.db.RecentlyWatched(200) }
@@ -298,35 +378,62 @@ func (a *App) mediaHandler() http.Handler {
 			a.serveRemoteThumb(w, r)
 			return
 		}
-		p := r.URL.Query().Get("p")
-		if p == "" {
-			http.NotFound(w, r)
-			return
-		}
-		abs, err := filepath.Abs(p)
-		if err != nil || !strings.HasPrefix(strings.ToLower(abs), strings.ToLower(a.mediaRoot)) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		f, err := os.Open(abs)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		defer f.Close()
-		st, err := f.Stat()
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		// Thumbnails never change once written — let the webview cache them so
-		// revisiting a grid is instant instead of re-fetching every image.
-		switch strings.ToLower(filepath.Ext(abs)) {
-		case ".jpg", ".jpeg", ".png", ".webp":
-			w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
-		}
-		http.ServeContent(w, r, filepath.Base(abs), st.ModTime(), f)
+		a.serveMediaFile(w, r)
 	})
+}
+
+// serveMediaFile streams a file under the media root with full HTTP range
+// support (so video scrubbing works without buffering the whole file).
+func (a *App) serveMediaFile(w http.ResponseWriter, r *http.Request) {
+	p := r.URL.Query().Get("p")
+	if p == "" {
+		http.NotFound(w, r)
+		return
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil || !strings.HasPrefix(strings.ToLower(abs), strings.ToLower(a.mediaRoot)) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	switch strings.ToLower(filepath.Ext(abs)) {
+	case ".jpg", ".jpeg", ".png", ".webp":
+		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+	}
+	http.ServeContent(w, r, filepath.Base(abs), st.ModTime(), f) // handles Range / 206
+}
+
+// startMediaServer runs a tiny localhost HTTP server for media. Serving video
+// over a real HTTP origin (not the webview asset scheme) makes seeking in long
+// files reliable, and is the basis for streaming to other devices later.
+func (a *App) startMediaServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/media", a.serveMediaFile)
+	mux.HandleFunc("/rthumb", a.serveRemoteThumb)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return
+	}
+	a.mediaPort = ln.Addr().(*net.TCPAddr).Port
+	go func() { _ = http.Serve(ln, mux) }()
+}
+
+// MediaBase is the base URL of the local media server (for video playback).
+func (a *App) MediaBase() string {
+	if a.mediaPort == 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", a.mediaPort)
 }
 
 // serveRemoteThumb proxies a Pornhub video's poster image (via its og:image)

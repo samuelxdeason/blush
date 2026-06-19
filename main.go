@@ -26,6 +26,7 @@ func main() {
 			Assets:  assets,
 			Handler: app.mediaHandler(), // serves /media?p=… for seekable playback
 		},
+		DragAndDrop: &options.DragAndDrop{EnableFileDrop: true},
 		BackgroundColour: &options.RGBA{R: 15, G: 20, B: 25, A: 1},
 		OnStartup:        app.startup,
 		Bind: []interface{}{

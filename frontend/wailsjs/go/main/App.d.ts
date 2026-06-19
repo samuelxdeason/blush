@@ -4,6 +4,8 @@ import {main} from '../models';
 import {downloader} from '../models';
 import {library} from '../models';
 
+export function AllLabels():Promise<Array<string>>;
+
 export function ChooseMediaRoot():Promise<string>;
 
 export function ClearFinished():Promise<void>;
@@ -16,13 +18,31 @@ export function Enqueue(arg1:string):Promise<string>;
 
 export function Enumerate(arg1:string):Promise<Array<downloader.RemoteItem>>;
 
+export function Favorites():Promise<Array<library.Video>>;
+
+export function GetModelInfo(arg1:string):Promise<library.ModelInfo>;
+
+export function Import(arg1:Array<string>,arg2:string):Promise<void>;
+
+export function ImportFilesDialog(arg1:string):Promise<void>;
+
+export function ImportFolderDialog():Promise<void>;
+
+export function ImportPhotosDialog(arg1:string):Promise<void>;
+
+export function LabelCounts():Promise<Array<library.LabelCount>>;
+
 export function MarkWatched(arg1:string,arg2:string):Promise<void>;
+
+export function MediaBase():Promise<string>;
 
 export function MediaRootPath():Promise<string>;
 
 export function Models():Promise<Array<library.Model>>;
 
 export function OpenFolder(arg1:string):Promise<void>;
+
+export function PhotosByModel(arg1:string):Promise<Array<library.Photo>>;
 
 export function Queue():Promise<Array<downloader.Job>>;
 
@@ -34,12 +54,26 @@ export function RemoveJob(arg1:string):Promise<void>;
 
 export function RestartApp():Promise<void>;
 
+export function SaveModelInfo(arg1:string,arg2:string,arg3:Array<library.ModelLink>):Promise<void>;
+
 export function Search(arg1:string):Promise<Array<library.Video>>;
 
 export function SetCookieSpec(arg1:string):Promise<void>;
 
+export function SetFavorite(arg1:string,arg2:string,arg3:boolean):Promise<void>;
+
+export function SetLabels(arg1:string,arg2:string,arg3:Array<string>):Promise<void>;
+
+export function SetModelCover(arg1:string,arg2:string):Promise<void>;
+
+export function SetModels(arg1:string,arg2:string,arg3:Array<string>):Promise<void>;
+
+export function SetTitle(arg1:string,arg2:string,arg3:string):Promise<void>;
+
 export function Stats():Promise<library.Stats>;
 
-export function Videos(arg1:string,arg2:string):Promise<Array<library.Video>>;
+export function VideosByLabel(arg1:string):Promise<Array<library.Video>>;
+
+export function VideosByModel(arg1:string):Promise<Array<library.Video>>;
 
 export function VideosBySite(arg1:string):Promise<Array<library.Video>>;

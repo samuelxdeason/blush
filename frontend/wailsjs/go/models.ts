@@ -51,12 +51,26 @@ export namespace downloader {
 
 export namespace library {
 	
+	export class LabelCount {
+	    label: string;
+	    count: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LabelCount(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.label = source["label"];
+	        this.count = source["count"];
+	    }
+	}
 	export class Model {
-	    site: string;
-	    uploader: string;
+	    name: string;
 	    count: number;
 	    totalSeconds: number;
 	    bytes: number;
+	    sites: string;
 	    thumbnail: string;
 	
 	    static createFrom(source: any = {}) {
@@ -65,12 +79,83 @@ export namespace library {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.site = source["site"];
-	        this.uploader = source["uploader"];
+	        this.name = source["name"];
 	        this.count = source["count"];
 	        this.totalSeconds = source["totalSeconds"];
 	        this.bytes = source["bytes"];
+	        this.sites = source["sites"];
 	        this.thumbnail = source["thumbnail"];
+	    }
+	}
+	export class ModelLink {
+	    label: string;
+	    url: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ModelLink(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.label = source["label"];
+	        this.url = source["url"];
+	    }
+	}
+	export class ModelInfo {
+	    name: string;
+	    bio: string;
+	    links: ModelLink[];
+	    cover: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ModelInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.bio = source["bio"];
+	        this.links = this.convertValues(source["links"], ModelLink);
+	        this.cover = source["cover"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
+	export class Photo {
+	    id: string;
+	    model: string;
+	    filepath: string;
+	    filename: string;
+	    added: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Photo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.model = source["model"];
+	        this.filepath = source["filepath"];
+	        this.filename = source["filename"];
+	        this.added = source["added"];
 	    }
 	}
 	export class SiteStat {
@@ -130,6 +215,7 @@ export namespace library {
 	    site: string;
 	    title: string;
 	    uploader: string;
+	    models: string[];
 	    duration?: number;
 	    width?: number;
 	    height?: number;
@@ -148,6 +234,8 @@ export namespace library {
 	    filesize?: number;
 	    added: string;
 	    watched_at: string;
+	    favorite: boolean;
+	    labels: string[];
 	
 	    static createFrom(source: any = {}) {
 	        return new Video(source);
@@ -159,6 +247,7 @@ export namespace library {
 	        this.site = source["site"];
 	        this.title = source["title"];
 	        this.uploader = source["uploader"];
+	        this.models = source["models"];
 	        this.duration = source["duration"];
 	        this.width = source["width"];
 	        this.height = source["height"];
@@ -177,6 +266,8 @@ export namespace library {
 	        this.filesize = source["filesize"];
 	        this.added = source["added"];
 	        this.watched_at = source["watched_at"];
+	        this.favorite = source["favorite"];
+	        this.labels = source["labels"];
 	    }
 	}
 
