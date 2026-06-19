@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+:root {
+  --ac: #ff2d77; /* accent, overridden per source (Pornhub orange / X white) */
+}
+
+body {
+  margin: 0;
+  /* warm, dark, sensual backdrop */
+  background:
+    radial-gradient(1100px 520px at 78% -12%, rgba(255, 45, 119, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 0% 110%, rgba(255, 144, 0, 0.06), transparent 55%),
+    #08080b;
+  color: #e7e9ea;
+  font-family: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* Image-forward content tiles: lift + glow on hover, image zoom */
+.tile {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #15151c;
+  cursor: pointer;
+  transition: transform 0.22s ease, box-shadow 0.22s ease;
+}
+.tile:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 0 0 2px var(--ac), 0 14px 44px rgba(0, 0, 0, 0.65);
+  z-index: 1;
+}
+.tile img {
+  transition: transform 0.45s ease, filter 0.3s ease;
+  filter: saturate(1.05);
+}
+.tile:hover img {
+  transform: scale(1.07);
+  filter: saturate(1.15) contrast(1.03);
+}
+.tile .overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.9) 0%, rgba(0, 0, 0, 0.15) 42%, transparent 70%);
+  pointer-events: none;
+}
+.tile .playbtn {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.tile:hover .playbtn {
+  opacity: 1;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3140;
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4150;
+}
