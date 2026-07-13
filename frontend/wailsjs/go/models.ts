@@ -1,3 +1,22 @@
+export namespace core {
+	
+	export class CookieStatus {
+	    x: boolean;
+	    pornhub: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new CookieStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.x = source["x"];
+	        this.pornhub = source["pornhub"];
+	    }
+	}
+
+}
+
 export namespace downloader {
 	
 	export class Job {
@@ -51,6 +70,28 @@ export namespace downloader {
 
 export namespace library {
 	
+	export class Collection {
+	    id: number;
+	    name: string;
+	    hidden: boolean;
+	    locked: boolean;
+	    count: number;
+	    created: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Collection(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.hidden = source["hidden"];
+	        this.locked = source["locked"];
+	        this.count = source["count"];
+	        this.created = source["created"];
+	    }
+	}
 	export class LabelCount {
 	    label: string;
 	    count: number;
@@ -236,6 +277,7 @@ export namespace library {
 	    watched_at: string;
 	    favorite: boolean;
 	    labels: string[];
+	    position?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Video(source);
@@ -268,6 +310,7 @@ export namespace library {
 	        this.watched_at = source["watched_at"];
 	        this.favorite = source["favorite"];
 	        this.labels = source["labels"];
+	        this.position = source["position"];
 	    }
 	}
 
@@ -275,19 +318,51 @@ export namespace library {
 
 export namespace main {
 	
-	export class CookieStatus {
-	    x: boolean;
-	    pornhub: boolean;
+	export class boundTypes {
+	    video: library.Video;
+	    model: library.Model;
+	    photo: library.Photo;
+	    modelInfo: library.ModelInfo;
+	    labelCount: library.LabelCount;
+	    stats: library.Stats;
+	    collection: library.Collection;
+	    job: downloader.Job;
+	    remoteItem: downloader.RemoteItem;
 	
 	    static createFrom(source: any = {}) {
-	        return new CookieStatus(source);
+	        return new boundTypes(source);
 	    }
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.x = source["x"];
-	        this.pornhub = source["pornhub"];
+	        this.video = this.convertValues(source["video"], library.Video);
+	        this.model = this.convertValues(source["model"], library.Model);
+	        this.photo = this.convertValues(source["photo"], library.Photo);
+	        this.modelInfo = this.convertValues(source["modelInfo"], library.ModelInfo);
+	        this.labelCount = this.convertValues(source["labelCount"], library.LabelCount);
+	        this.stats = this.convertValues(source["stats"], library.Stats);
+	        this.collection = this.convertValues(source["collection"], library.Collection);
+	        this.job = this.convertValues(source["job"], downloader.Job);
+	        this.remoteItem = this.convertValues(source["remoteItem"], downloader.RemoteItem);
 	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 }

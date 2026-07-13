@@ -2,148 +2,81 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"media-vault/internal/core"
 	"media-vault/internal/downloader"
 	"media-vault/internal/library"
+	"media-vault/internal/server"
 )
 
-const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-	"(KHTML, like Gecko) Chrome/133.0 Safari/537.36"
-
-var (
-	ogImageRe = regexp.MustCompile(`<meta\s+property="og:image"\s+content="([^"]+)"`)
-	ogCache   = map[string]string{}
-	ogMu      sync.Mutex
-)
-
-// ogImage fetches a page's og:image URL, reading only the document head and
-// caching the result. Pornhub's anti-bot 403s plain requests, so we send
-// browser headers + the logged-in cookies (same as a real browser would).
-func (a *App) ogImage(pageURL string) string {
-	ogMu.Lock()
-	if v, ok := ogCache[pageURL]; ok {
-		ogMu.Unlock()
-		return v
-	}
-	ogMu.Unlock()
-
-	req, _ := http.NewRequest("GET", pageURL, nil)
-	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	if ck := a.siteCookieHeader("pornhub"); ck != "" {
-		req.Header.Set("Cookie", ck)
-	}
-	img := ""
-	if resp, err := http.DefaultClient.Do(req); err == nil {
-		head, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-		resp.Body.Close()
-		if m := ogImageRe.FindStringSubmatch(string(head)); len(m) > 1 {
-			img = m[1]
-		}
-	}
-	if img != "" { // don't cache transient failures
-		ogMu.Lock()
-		ogCache[pageURL] = img
-		ogMu.Unlock()
-	}
-	return img
-}
-
-// siteCookieHeader builds a "name=value; …" Cookie header from the vault's
-// cookies.txt for the given site substring (e.g. "pornhub").
-func (a *App) siteCookieHeader(site string) string {
-	data, _ := os.ReadFile(a.cookiesPath())
-	var parts []string
-	for _, ln := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(ln, "#") || strings.TrimSpace(ln) == "" {
-			continue
-		}
-		f := strings.Split(strings.TrimRight(ln, "\r"), "\t")
-		if len(f) >= 7 && strings.Contains(f[0], site) {
-			parts = append(parts, f[5]+"="+f[6])
-		}
-	}
-	return strings.Join(parts, "; ")
-}
-
-// defaultMediaRoot is used until the user picks a location in Settings.
-const defaultMediaRoot = `D:\MediaVault`
-
-// appConfig persists settings (the media root) OUTSIDE the vault, so the vault
-// itself can move freely to another drive.
-type appConfig struct {
-	MediaRoot string `json:"mediaRoot"`
-}
-
-func configPath() string {
-	return filepath.Join(os.Getenv("LOCALAPPDATA"), "MediaVault", "config.json")
-}
-
-func loadConfig() appConfig {
-	var c appConfig
-	if data, err := os.ReadFile(configPath()); err == nil {
-		_ = json.Unmarshal(data, &c)
-	}
-	if strings.TrimSpace(c.MediaRoot) == "" {
-		c.MediaRoot = defaultMediaRoot
-	}
-	return c
-}
-
-func saveConfig(c appConfig) {
-	_ = os.MkdirAll(filepath.Dir(configPath()), 0o755)
-	if data, err := json.MarshalIndent(c, "", "  "); err == nil {
-		_ = os.WriteFile(configPath(), data, 0o644)
-	}
-}
-
-// App is the single object the UI talks to. Its exported methods are callable
-// directly from the frontend (no network/API in between).
+// App is the thin desktop shell. The catalogue, downloads, and media serving all
+// live in core and are exposed over an in-process HTTP server that the web UI
+// talks to (same code path as the headless daemon). App keeps only the operations
+// that need the native OS: file dialogs, revealing files, and relaunching.
 type App struct {
-	ctx       context.Context
-	db        *library.DB
-	dl        *downloader.Downloader
-	mediaRoot string
-	mediaPort int
+	ctx      context.Context
+	core     *core.Core
+	apiBase  string // http://127.0.0.1:<port>, served in-process for the web UI
+	mediaRot string // resolved vault path
 }
 
-func NewApp() *App { return &App{mediaRoot: loadConfig().MediaRoot} }
+func NewApp() *App { return &App{} }
 
-// ---- settings + storage (called from the UI) ---------------------------
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+	a.mediaRot = core.ResolveRoot("")
 
-// MediaRootPath returns the current vault location.
-func (a *App) MediaRootPath() string { return a.mediaRoot }
-
-// ChooseMediaRoot opens a folder picker, saves the chosen location, and returns
-// it. Takes effect on next launch (call RestartApp).
-func (a *App) ChooseMediaRoot() string {
-	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Choose your Media Vault folder",
-	})
-	if err != nil || strings.TrimSpace(dir) == "" {
-		return a.mediaRoot
+	hub := server.NewHub()
+	c, err := core.New(a.mediaRot, hub.Broadcast)
+	if err != nil {
+		runtime.LogError(ctx, "open vault: "+err.Error())
+		return
 	}
-	saveConfig(appConfig{MediaRoot: dir})
+	a.core = c
+
+	// Serve the API + media + events on a random localhost port; the web UI (loaded
+	// by Wails from embedded assets) calls this base. ui is nil — Wails serves the UI.
+	srv := server.New(c, hub, nil)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		runtime.LogError(ctx, "listen: "+err.Error())
+		return
+	}
+	a.apiBase = fmt.Sprintf("http://127.0.0.1:%d", ln.Addr().(*net.TCPAddr).Port)
+	go func() { _ = http.Serve(ln, srv.Handler()) }()
+
+	// Drag-and-drop: forward dropped local paths to the UI (via the same SSE hub
+	// as every other event), which imports them.
+	runtime.OnFileDrop(ctx, func(_, _ int, paths []string) {
+		hub.Broadcast("filedrop", paths)
+	})
+}
+
+// ---- bindings the web UI calls only when running inside the desktop shell ----
+
+// APIBase is the base URL of the in-process server (the web UI's data path).
+func (a *App) APIBase() string { return a.apiBase }
+
+// ChooseMediaRoot opens a folder picker and saves the choice (next-launch).
+func (a *App) ChooseMediaRoot() string {
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{Title: "Choose your Media Vault folder"})
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return a.mediaRot
+	}
+	_ = core.SaveRoot(dir)
 	return dir
 }
 
-// RestartApp relaunches the app (after a short delay so this instance fully
-// exits and releases its window profile first).
+// RestartApp relaunches the app after a short delay (so the window profile frees).
 func (a *App) RestartApp() {
 	exe, _ := os.Executable()
 	_ = exec.Command("cmd", "/c",
@@ -151,171 +84,26 @@ func (a *App) RestartApp() {
 	runtime.Quit(a.ctx)
 }
 
-// Stats returns the storage breakdown for the Settings page.
-func (a *App) Stats() (library.Stats, error) { return a.db.Stats() }
-
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-	_ = os.MkdirAll(a.mediaRoot, 0o755)
-	a.startMediaServer()
-
-	db, err := library.Open(filepath.Join(a.mediaRoot, "library.db"), a.mediaRoot)
-	if err != nil {
-		runtime.LogError(ctx, "open library: "+err.Error())
-		return
-	}
-	a.db = db
-
-	// First run: import the existing library.json once.
-	if n, _ := db.Count(); n == 0 {
-		jsonPath := filepath.Join(a.mediaRoot, "library.json")
-		if _, statErr := os.Stat(jsonPath); statErr == nil {
-			if imported, mErr := db.MigrateFromJSON(jsonPath); mErr == nil {
-				runtime.LogInfo(ctx, "migrated library.json: "+itoa(imported))
-			}
-		}
-	}
-
-	emit := func(event string, data any) { runtime.EventsEmit(ctx, event, data) }
-	a.dl = downloader.New(downloader.Config{
-		YtDlp:     ytdlpPath(),
-		FfmpegDir: ffmpegDir(),
-		MediaRoot: a.mediaRoot,
-		Archive:   filepath.Join(a.mediaRoot, "downloaded.archive"),
-	}, db, emit)
-
-	// Auto-use a cookies.txt sitting in the vault, so X/protected downloads work
-	// without any setup once cookies are connected.
-	if _, err := os.Stat(a.cookiesPath()); err == nil {
-		a.dl.SetCookieSpec("file:" + a.cookiesPath())
-	}
-
-	// Drag-and-drop: forward dropped file/folder paths to the UI, which decides
-	// the target model and calls Import.
-	runtime.OnFileDrop(ctx, func(_, _ int, paths []string) {
-		runtime.EventsEmit(ctx, "filedrop", paths)
-	})
-}
-
-func (a *App) cookiesPath() string { return filepath.Join(a.mediaRoot, "cookies.txt") }
-
-// CookieStatus reports which services have login cookies connected.
-type CookieStatus struct {
-	X       bool `json:"x"`
-	Pornhub bool `json:"pornhub"`
-}
-
-func (a *App) CookieStatus() CookieStatus {
-	data, _ := os.ReadFile(a.cookiesPath())
-	s := string(data)
-	return CookieStatus{
-		X:       strings.Contains(s, "x.com") || strings.Contains(s, "twitter.com"),
-		Pornhub: strings.Contains(s, "pornhub.com"),
-	}
-}
-
-// ConnectCookies imports a cookies.txt and MERGES it into the vault's cookie
-// file, so X and Pornhub logins can coexist in one auto-loaded file.
-func (a *App) ConnectCookies() CookieStatus {
+// ConnectCookies imports a cookies.txt via a file dialog and merges it into the vault.
+func (a *App) ConnectCookies() core.CookieStatus {
 	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
 		Title:   "Choose a cookies.txt exported from x.com or pornhub.com",
 		Filters: []runtime.FileFilter{{DisplayName: "Cookies file (*.txt)", Pattern: "*.txt"}},
 	})
 	if err != nil || path == "" {
-		return a.CookieStatus()
+		return a.core.CookieStatus()
 	}
-	if data, e := os.ReadFile(path); e == nil {
-		existing, _ := os.ReadFile(a.cookiesPath())
-		merged := mergeCookies(string(existing), string(data))
-		if os.WriteFile(a.cookiesPath(), []byte(merged), 0o644) == nil {
-			a.dl.SetCookieSpec("file:" + a.cookiesPath())
-		}
-	}
-	return a.CookieStatus()
+	return a.core.MergeCookiesFromFile(path)
 }
 
-// mergeCookies combines two Netscape cookie files, de-duped by domain+name with
-// the incoming file winning.
-func mergeCookies(existing, incoming string) string {
-	type key struct{ domain, name string }
-	seen := map[key]string{}
-	var order []key
-	add := func(text string) {
-		for _, ln := range strings.Split(text, "\n") {
-			t := strings.TrimRight(ln, "\r")
-			if s := strings.TrimSpace(t); s == "" || strings.HasPrefix(s, "#") {
-				continue
-			}
-			f := strings.Split(t, "\t")
-			if len(f) < 7 {
-				continue
-			}
-			k := key{f[0], f[5]}
-			if _, ok := seen[k]; !ok {
-				order = append(order, k)
-			}
-			seen[k] = t
-		}
-	}
-	add(existing)
-	add(incoming) // incoming overwrites same-key cookies
-	var b strings.Builder
-	b.WriteString("# Netscape HTTP Cookie File\n")
-	for _, k := range order {
-		b.WriteString(seen[k])
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
-
-// ---- bound methods (called from the UI) --------------------------------
-
-func (a *App) Enqueue(url string) string                          { return a.dl.Enqueue(url) }
-func (a *App) Enumerate(url string) ([]downloader.RemoteItem, error) { return a.dl.Enumerate(url) }
-func (a *App) Queue() []downloader.Job                             { return a.dl.Snapshot() }
-func (a *App) RemoveJob(id string)       { a.dl.RemoveJob(id) }
-func (a *App) ClearFinished()            { a.dl.ClearFinished() }
-func (a *App) SetCookieSpec(spec string) { a.dl.SetCookieSpec(spec) }
-
-func (a *App) Models() ([]library.Model, error)                  { return a.db.Models() }
-func (a *App) VideosByModel(model string) ([]library.Video, error) { return a.db.VideosByModel(model) }
-func (a *App) VideosBySite(site string) ([]library.Video, error)  { return a.db.VideosBySite(site) }
-
-// SetModels reassigns a video's model set ([] = Unassigned).
-func (a *App) SetModels(site, id string, models []string) error { return a.db.SetModels(site, id, models) }
-
-// SetTitle renames a video.
-func (a *App) SetTitle(site, id, title string) error { return a.db.SetTitle(site, id, title) }
-
-// SetFavorite likes/unlikes a video.
-func (a *App) SetFavorite(site, id string, fav bool) error { return a.db.SetFavorite(site, id, fav) }
-
-// SetLabels sets a video's categories.
-func (a *App) SetLabels(site, id string, labels []string) error { return a.db.SetLabels(site, id, labels) }
-
-// AllLabels returns every category in use (for autocomplete).
-func (a *App) AllLabels() ([]string, error) { return a.db.AllLabels() }
-
-// LabelCounts returns every category with its video count.
-func (a *App) LabelCounts() ([]library.LabelCount, error) { return a.db.LabelCounts() }
-
-// VideosByLabel returns videos tagged with a category.
-func (a *App) VideosByLabel(label string) ([]library.Video, error) { return a.db.VideosByLabel(label) }
-
-// Favorites returns liked videos.
-func (a *App) Favorites() ([]library.Video, error) { return a.db.Favorites() }
-
-// Import copies local video files/folders into the library under model.
-func (a *App) Import(paths []string, model string) { a.dl.Import(paths, model) }
-
-// ImportFilesDialog opens a multi-file picker and imports the chosen videos.
+// ImportFilesDialog opens a multi-file picker and imports the chosen media.
 func (a *App) ImportFilesDialog(model string) {
 	paths, err := runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{
 		Title:   "Choose videos to import",
 		Filters: []runtime.FileFilter{{DisplayName: "Videos", Pattern: "*.mp4;*.mkv;*.webm;*.mov;*.m4v;*.avi;*.ts"}},
 	})
 	if err == nil && len(paths) > 0 {
-		a.dl.Import(paths, model)
+		a.core.Import(paths, model)
 	}
 }
 
@@ -323,23 +111,9 @@ func (a *App) ImportFilesDialog(model string) {
 func (a *App) ImportFolderDialog() {
 	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{Title: "Choose a folder of videos to import"})
 	if err == nil && dir != "" {
-		a.dl.Import([]string{dir}, "")
+		a.core.Import([]string{dir}, "")
 	}
 }
-
-// PhotosByModel returns a model's photos.
-func (a *App) PhotosByModel(model string) ([]library.Photo, error) { return a.db.PhotosByModel(model) }
-
-// GetModelInfo returns a model's profile (bio, links, cover).
-func (a *App) GetModelInfo(name string) (library.ModelInfo, error) { return a.db.GetModelInfo(name) }
-
-// SaveModelInfo saves a model's bio + links.
-func (a *App) SaveModelInfo(name, bio string, links []library.ModelLink) error {
-	return a.db.SaveModelInfo(name, bio, links)
-}
-
-// SetModelCover sets a model's cover image (absolute path to a photo).
-func (a *App) SetModelCover(name, cover string) error { return a.db.SetModelCover(name, cover) }
 
 // ImportPhotosDialog opens an image picker and attaches the chosen photos to model.
 func (a *App) ImportPhotosDialog(model string) {
@@ -348,17 +122,31 @@ func (a *App) ImportPhotosDialog(model string) {
 		Filters: []runtime.FileFilter{{DisplayName: "Images", Pattern: "*.jpg;*.jpeg;*.png;*.webp;*.gif;*.bmp"}},
 	})
 	if err == nil && len(paths) > 0 {
-		a.dl.Import(paths, model)
+		a.core.Import(paths, model)
 	}
 }
-func (a *App) Search(q string) ([]library.Video, error)              { return a.db.Search(q) }
-func (a *App) RecentlyDownloaded() ([]library.Video, error)          { return a.db.RecentlyDownloaded(200) }
-func (a *App) RecentlyWatched() ([]library.Video, error)             { return a.db.RecentlyWatched(200) }
 
-// MarkWatched records that a video was just opened (Recently Watched).
-func (a *App) MarkWatched(site, id string) {
-	_ = a.db.MarkWatched(site, id, time.Now().Format("2006-01-02 15:04:05"))
+// Import catalogues local file/folder paths under model (used by drag-and-drop).
+func (a *App) Import(paths []string, model string) { a.core.Import(paths, model) }
+
+// boundTypes exists only so Wails emits TypeScript definitions for the models the
+// web UI consumes over HTTP. Wails can't see the HTTP API, so without this the
+// generated models.ts would omit these types. Never called at runtime.
+type boundTypes struct {
+	Video      library.Video      `json:"video"`
+	Model      library.Model      `json:"model"`
+	Photo      library.Photo      `json:"photo"`
+	ModelInfo  library.ModelInfo  `json:"modelInfo"`
+	LabelCount library.LabelCount `json:"labelCount"`
+	Stats      library.Stats      `json:"stats"`
+	Collection library.Collection `json:"collection"`
+	Job        downloader.Job     `json:"job"`
+	RemoteItem downloader.RemoteItem `json:"remoteItem"`
 }
+
+// Types is a binding stub that keeps boundTypes (and its field types) in the
+// generated TypeScript. Never call it.
+func (a *App) Types() boundTypes { return boundTypes{} }
 
 // OpenFolder reveals a file or folder in Explorer.
 func (a *App) OpenFolder(path string) {
@@ -366,162 +154,4 @@ func (a *App) OpenFolder(path string) {
 		path = filepath.Dir(path)
 	}
 	_ = exec.Command("explorer", path).Start()
-}
-
-// ---- in-process media handler (seekable local playback) ----------------
-
-// mediaHandler serves files under the media root to the webview, with HTTP
-// range support so video scrubbing works. Nothing is exposed off-machine.
-func (a *App) mediaHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/rthumb" {
-			a.serveRemoteThumb(w, r)
-			return
-		}
-		a.serveMediaFile(w, r)
-	})
-}
-
-// serveMediaFile streams a file under the media root with full HTTP range
-// support (so video scrubbing works without buffering the whole file).
-func (a *App) serveMediaFile(w http.ResponseWriter, r *http.Request) {
-	p := r.URL.Query().Get("p")
-	if p == "" {
-		http.NotFound(w, r)
-		return
-	}
-	abs, err := filepath.Abs(p)
-	if err != nil || !strings.HasPrefix(strings.ToLower(abs), strings.ToLower(a.mediaRoot)) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	f, err := os.Open(abs)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	switch strings.ToLower(filepath.Ext(abs)) {
-	case ".jpg", ".jpeg", ".png", ".webp":
-		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
-	}
-	http.ServeContent(w, r, filepath.Base(abs), st.ModTime(), f) // handles Range / 206
-}
-
-// startMediaServer runs a tiny localhost HTTP server for media. Serving video
-// over a real HTTP origin (not the webview asset scheme) makes seeking in long
-// files reliable, and is the basis for streaming to other devices later.
-func (a *App) startMediaServer() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/media", a.serveMediaFile)
-	mux.HandleFunc("/rthumb", a.serveRemoteThumb)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return
-	}
-	a.mediaPort = ln.Addr().(*net.TCPAddr).Port
-	go func() { _ = http.Serve(ln, mux) }()
-}
-
-// MediaBase is the base URL of the local media server (for video playback).
-func (a *App) MediaBase() string {
-	if a.mediaPort == 0 {
-		return ""
-	}
-	return fmt.Sprintf("http://127.0.0.1:%d", a.mediaPort)
-}
-
-// serveRemoteThumb proxies a Pornhub video's poster image (via its og:image)
-// so the Sync grid can show thumbnails that always load and get cached.
-func (a *App) serveRemoteThumb(w http.ResponseWriter, r *http.Request) {
-	v := r.URL.Query().Get("v")
-	if v == "" || !strings.Contains(strings.ToLower(v), "pornhub.com") {
-		http.NotFound(w, r)
-		return
-	}
-	img := a.ogImage(v)
-	if img == "" {
-		http.NotFound(w, r)
-		return
-	}
-	req, _ := http.NewRequest("GET", img, nil)
-	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Accept", "image/avif,image/webp,*/*")
-	req.Header.Set("Referer", "https://www.pornhub.com/")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		http.NotFound(w, r)
-		return
-	}
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = "image/jpeg"
-	}
-	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "public, max-age=604800")
-	_, _ = io.Copy(w, resp.Body)
-}
-
-// ---- tool discovery -----------------------------------------------------
-
-func ytdlpPath() string {
-	exe, _ := os.Executable()
-	dir := filepath.Dir(exe)
-	for _, c := range []string{
-		filepath.Join(dir, "yt-dlp.exe"),
-		filepath.Join(dir, "resources", "yt-dlp.exe"),
-		filepath.Join("resources", "yt-dlp.exe"), // wails dev: cwd = project root
-	} {
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
-	}
-	if p, err := exec.LookPath("yt-dlp"); err == nil {
-		return p
-	}
-	return "yt-dlp.exe"
-}
-
-func ffmpegDir() string {
-	if p, err := exec.LookPath("ffmpeg"); err == nil {
-		return filepath.Dir(p)
-	}
-	pattern := filepath.Join(os.Getenv("LOCALAPPDATA"),
-		`Microsoft\WinGet\Packages`, "*FFmpeg*", "*", "bin", "ffmpeg.exe")
-	if m, _ := filepath.Glob(pattern); len(m) > 0 {
-		return filepath.Dir(m[0])
-	}
-	return ""
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }

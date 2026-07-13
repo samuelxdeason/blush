@@ -1,13 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Models, VideosByModel, Search, RecentlyDownloaded, RecentlyWatched, MarkWatched, SetModels, SetTitle,
-  SetFavorite, SetLabels, AllLabels, Favorites, LabelCounts, VideosByLabel,
-  Enqueue, Enumerate, Queue, RemoveJob, ClearFinished, Import, ImportFilesDialog, ImportFolderDialog,
-  PhotosByModel, ImportPhotosDialog, GetModelInfo, SaveModelInfo, SetModelCover,
+  Models, VideosByModel, Search, RecentlyDownloaded, RecentlyWatched, ContinueWatching, MarkWatched, SetPosition, SetModels, SetTitle,
+  SetFavorite, SetLabels, AllLabels, Favorites, LabelCounts, VideosByLabel, UnassignModel,
+  Enqueue, EnqueueMany, Enumerate, SyncedLists, RemoveSync, Queue, RemoveJob, ClearFinished, Import, ImportFilesDialog, ImportFolderDialog,
+  PhotosByModel, ImportPhotosDialog, GetModelInfo, SaveModelInfo, SetModelCover, SetAvatarFromURL, UploadAvatar, FetchAvatar, FetchAllAvatars,
   CookieStatus, ConnectCookies, OpenFolder,
-  MediaRootPath, ChooseMediaRoot, RestartApp, Stats, MediaBase,
-} from "../wailsjs/go/main/App";
-import { EventsOn, BrowserOpenURL } from "../wailsjs/runtime/runtime";
+  MediaRootPath, ChooseMediaRoot, RestartApp, Stats, MediaBase, RebuildLibrary, BackupCatalogue, OptimizeStreaming, isDesktopApp,
+  Collections, CreateCollection, RenameCollection, SetCollectionHidden, SetCollectionLocked,
+  DeleteCollection, AddToCollection, RemoveFromCollection, VideosByCollection, CollectionsForVideo,
+  EventsOn, BrowserOpenURL,
+} from "./api";
+import type { SyncSummary } from "./api";
 import { library, downloader } from "../wailsjs/go/models";
 
 type Model = library.Model;
@@ -15,26 +18,53 @@ type Video = library.Video;
 type Photo = library.Photo;
 type ModelInfo = library.ModelInfo;
 type ModelLink = library.ModelLink;
+type Collection = library.Collection;
 type Job = downloader.Job;
 
-const mediaURL = (p?: string) => (p ? `/media?p=${encodeURIComponent(p)}` : "");
-// Video streams from a real localhost HTTP server (set once at startup) so
-// seeking in long files is reliable; thumbnails keep using the asset path.
+// All media (video + thumbnails) streams from the HTTP server, set once at
+// startup, with HTTP range support so seeking in long files is reliable. In the
+// browser this is same-origin (""); in the desktop app it's the in-process server.
 let MEDIA_BASE = "";
+const mediaURL = (p?: string) => (p ? `${MEDIA_BASE}/media?p=${encodeURIComponent(p)}` : "");
 const videoURL = (p?: string) => (p ? `${MEDIA_BASE}/media?p=${encodeURIComponent(p)}` : "");
 const SITE_LABEL: Record<string, string> = { Twitter: "X / Twitter", PornHub: "Pornhub" };
 const label = (s: string) => SITE_LABEL[s] || s;
-const UNASSIGNED = "Unassigned";
+const UNASSIGNED = "Unsorted";
 const modelLabel = (name: string) => (name ? name : UNASSIGNED);
 
+// Flavor presets — applied at runtime by setting --ac-rgb (Tailwind's accent
+// token + all glows derive from it), persisted in localStorage.
+const ACCENTS: { name: string; rgb: string }[] = [
+  { name: "Strawberry", rgb: "236 92 133" },
+  { name: "Peach", rgb: "247 128 86" },
+  { name: "Blueberry", rgb: "124 108 224" },
+  { name: "Matcha", rgb: "106 158 96" },
+  { name: "Mango", rgb: "240 158 42" },
+];
+const applyAccent = (rgb: string) => document.documentElement.style.setProperty("--ac-rgb", rgb);
+
+// Every collection gets its own fruit tint (rotating), so the sidebar reads
+// like a well-stocked fridge instead of a file tree.
+const COLL_TINTS = ["#F0568C", "#FF8A5C", "#8B7BF0", "#7FB069", "#FFB03A"];
+const collTint = (i: number) => COLL_TINTS[i % COLL_TINTS.length];
+
+// Hover previews only make sense where a real pointer can hover — on touch
+// screens the old touch handlers swallowed taps and spawned dozens of hidden
+// <video> loads while scrolling, which exhausts mobile decoders and made
+// perfectly good videos refuse to play until a reload.
+const CAN_HOVER = window.matchMedia?.("(hover: hover) and (pointer: fine)").matches ?? true;
+
 type Route =
+  | { kind: "home" }
   | { kind: "library" }
+  | { kind: "feed" }
   | { kind: "model"; name: string }
   | { kind: "recent" }
   | { kind: "watched" }
   | { kind: "favorites" }
   | { kind: "categories" }
   | { kind: "category"; label: string }
+  | { kind: "collection"; id: number; name: string }
   | { kind: "browse" }
   | { kind: "downloads" }
   | { kind: "settings" };
@@ -55,14 +85,83 @@ function fmtSize(b?: number) {
   const gb = b / 1073741824;
   return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(b / 1048576)} MB`;
 }
+// Relative time like "3d ago" from a "2006-01-02 15:04:05" stamp.
+function fmtAgo(s?: string) {
+  if (!s) return "never synced";
+  const t = Date.parse(s.replace(" ", "T"));
+  if (isNaN(t)) return "";
+  const min = Math.round((Date.now() - t) / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  if (min < 1440) return `${Math.round(min / 60)}h ago`;
+  if (min < 43200) return `${Math.round(min / 1440)}d ago`;
+  return new Date(t).toLocaleDateString();
+}
+const SYNC_ICON: Record<string, string> = { favorites: "❤", pornstar: "★", model: "★", channel: "📺", user: "👤", list: "≣" };
+const kindIcon = (k: string) => SYNC_ICON[k] || "≣";
+
+// Greeting + flavor emoji for the Home header — a small yogurt touch.
+const FLAVOR_EMOJI: Record<string, string> = {
+  "236 92 133": "🍓", "247 128 86": "🍑", "124 108 224": "🫐", "106 158 96": "🍵", "240 158 42": "🥭",
+};
+const flavorEmoji = () => FLAVOR_EMOJI[localStorage.accent] || "🍓";
+const greeting = () => {
+  const h = new Date().getHours();
+  return h < 5 ? "Up late?" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+};
+
+// A video added within the last 3 days is flagged "NEW".
+function isNew(added?: string) {
+  if (!added) return false;
+  const t = Date.parse(added.replace(" ", "T"));
+  return !isNaN(t) && Date.now() - t < 3 * 86400000;
+}
 
 const STATUS_COLORS: Record<string, string> = {
   queued: "bg-edge text-muted",
-  downloading: "bg-accent text-white",
+  downloading: "bg-accent text-acink",
   done: "bg-emerald-500 text-emerald-950",
   duplicate: "bg-amber-500 text-amber-950",
   error: "bg-rose-600 text-white",
 };
+
+// Icon: one consistent hand-rolled stroke set (round caps = soft yogurt look),
+// replacing the mismatched emoji that used to fill the nav.
+function Icon({ name, className = "w-[18px] h-[18px]" }: { name: string; className?: string }) {
+  const p: Record<string, JSX.Element> = {
+    home: <><path d="M3.5 10.8 12 3.5l8.5 7.3" /><path d="M5.5 9.5V20a.8.8 0 0 0 .8.8H10v-5.6h4v5.6h3.7a.8.8 0 0 0 .8-.8V9.5" /></>,
+    feed: <><circle cx="12" cy="12" r="8.8" /><path d="M10.2 8.9v6.2L15.3 12z" fill="currentColor" stroke="none" /></>,
+    people: <><circle cx="9" cy="8.2" r="3.4" /><path d="M3.6 19.8c.5-3.4 2.7-5.3 5.4-5.3s4.9 1.9 5.4 5.3" /><path d="M15.3 5.5a3.4 3.4 0 0 1 0 5.4M17.6 14.9c1.5.9 2.5 2.6 2.8 4.9" /></>,
+    heart: <path d="M12 20.2C7.2 16.4 3.8 13.4 3.8 9.8 3.8 7.4 5.7 5.5 8 5.5c1.6 0 3.1.9 4 2.2.9-1.3 2.4-2.2 4-2.2 2.3 0 4.2 1.9 4.2 4.3 0 3.6-3.4 6.6-8.2 10.4z" />,
+    tag: <><path d="M3.8 12.3 11.5 20l8.3-8.3V4.2h-7.5L3.8 12.3z" /><circle cx="15.7" cy="8.3" r="1.3" /></>,
+    clock: <><circle cx="12" cy="12" r="8.8" /><path d="M12 7.2V12l3.3 2" /></>,
+    plus: <path d="M12 5.5v13M5.5 12h13" />,
+    spark: <><path d="M12 3.5 13.7 9 19.2 10.7 13.7 12.4 12 17.9 10.3 12.4 4.8 10.7 10.3 9z" /><path d="M18.5 16.5v4M16.5 18.5h4" /></>,
+    download: <><path d="M12 4.2v10.6m0 0 4.2-4.2M12 14.8 7.8 10.6" /><path d="M4.8 19.6h14.4" /></>,
+    gear: <><circle cx="12" cy="12" r="3.1" /><path d="M12 3v2.6M12 18.4V21M3 12h2.6M18.4 12H21M5.6 5.6l1.9 1.9M16.5 16.5l1.9 1.9M18.4 5.6l-1.9 1.9M7.5 16.5l-1.9 1.9" /></>,
+    folder: <path d="M3.8 7.3v10.9a1 1 0 0 0 1 1h14.4a1 1 0 0 0 1-1V9.3a1 1 0 0 0-1-1h-7.6l-2-2H4.8a1 1 0 0 0-1 1z" />,
+    hidden: <><path d="M4.2 12.8c2.4 2.3 5 3.4 7.8 3.4s5.4-1.1 7.8-3.4" /><path d="M12 16.6v2.6M7.2 15.5l-1.5 2.2M16.8 15.5l1.5 2.2" /></>,
+    lock: <><rect x="5.8" y="11" width="12.4" height="8.6" rx="2" /><path d="M8.7 11V8.2a3.3 3.3 0 0 1 6.6 0V11" /></>,
+    menu: <path d="M4.5 7.2h15M4.5 12h15M4.5 16.8h15" />,
+  };
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.9}
+      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden>
+      {p[name]}
+    </svg>
+  );
+}
+
+// Swirl: the little yogurt-swirl logo mark, tinted by the active flavor.
+function Swirl({ className = "w-6 h-6" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden>
+      <circle cx="12" cy="12" r="10" fill="var(--ac)" />
+      <path d="M16.8 8.2a6 6 0 1 0 1 5.2M12 8.8a3.4 3.4 0 1 0 3.3 4.3"
+        fill="none" stroke="rgba(255,253,250,.9)" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  );
+}
 
 function XLogo({ className = "" }: { className?: string }) {
   return (
@@ -77,7 +176,7 @@ function SourceBadge({ site, size = "sm" }: { site: string; size?: "sm" | "lg" }
   if (site === "PornHub")
     return (
       <span className={`font-extrabold tracking-tight ${big ? "text-2xl" : "text-[13px]"}`}>
-        <span className="text-white">Porn</span>
+        <span>Porn</span>
         <span className="bg-[#ff9000] text-black rounded px-1">hub</span>
       </span>
     );
@@ -102,12 +201,13 @@ function SiteTags({ sites }: { sites: string }) {
 
 export default function App() {
   const [models, setModels] = useState<Model[]>([]);
-  const [route, setRoute] = useState<Route>({ kind: "library" });
+  const [route, setRoute] = useState<Route>({ kind: "home" });
   const [videos, setVideos] = useState<Video[]>([]);
   const [siteFilter, setSiteFilter] = useState<string>("all");
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<Video[] | null>(null);
   const [playing, setPlaying] = useState<Video | null>(null);
+  const [playQueue, setPlayQueue] = useState<Video[]>([]); // lean-back playlist for autoplay-next
   const [queue, setQueue] = useState<Job[]>([]);
   const [importStatus, setImportStatus] = useState<{ done: number; total: number; name?: string; finished?: boolean } | null>(null);
 
@@ -115,9 +215,10 @@ export default function App() {
   const modelCtx = useRef("");
   modelCtx.current = route.kind === "model" ? route.name : "";
 
-  const accent = siteFilter === "PornHub" ? "#ff9000" : siteFilter === "Twitter" ? "#e7e9ea" : "#ff2d77";
   const modelNames = models.map((m) => m.name).filter(Boolean);
   const [allLabels, setAllLabels] = useState<string[]>([]);
+  const [collections, setCollections] = useState<Collection[]>([]);
+  const [videoTotal, setVideoTotal] = useState(0); // true distinct count (matches Settings)
   // Bumped on any data change; all loaders depend on it so views never go stale.
   const [version, setVersion] = useState(0);
   const reload = useCallback(() => setVersion((v) => v + 1), []);
@@ -125,15 +226,22 @@ export default function App() {
   const loadMeta = useCallback(() => {
     Models().then((m) => setModels(m || []));
     AllLabels().then((l) => setAllLabels(l || []));
+    Collections().then((c) => setCollections(c || []));
+    Stats().then((s) => setVideoTotal(s?.videoCount || 0));
   }, []);
   const loadVideos = useCallback(() => {
     if (route.kind === "recent") RecentlyDownloaded().then((v) => setVideos(v || []));
     else if (route.kind === "watched") RecentlyWatched().then((v) => setVideos(v || []));
     else if (route.kind === "favorites") Favorites().then((v) => setVideos(v || []));
     else if (route.kind === "category") VideosByLabel(route.label).then((v) => setVideos(v || []));
+    else if (route.kind === "collection") VideosByCollection(route.id).then((v) => setVideos(v || []));
   }, [route]);
 
-  useEffect(() => { Queue().then((q) => setQueue(q || [])); MediaBase().then((b) => { MEDIA_BASE = b; }); }, []);
+  useEffect(() => {
+    if (localStorage.accent) applyAccent(localStorage.accent); // restore chosen accent
+    Queue().then((q) => setQueue(q || []));
+    MediaBase().then((b) => { MEDIA_BASE = b; reload(); }); // re-render so media URLs pick up the base
+  }, [reload]);
   useEffect(() => { loadMeta(); }, [loadMeta, version]);
   useEffect(() => { loadVideos(); }, [loadVideos, version]);
 
@@ -151,7 +259,9 @@ export default function App() {
       setImportStatus(s);
       if (s.finished) { reload(); window.setTimeout(() => setImportStatus(null), 5000); }
     });
-    return () => { offQueue(); offProg(); offDrop(); offImport(); };
+    // Refresh grids as avatars stream in (and once the bulk run finishes).
+    const offAvatar = EventsOn("avatar", (s: any) => { if (s.finished || (s.added && s.added % 5 === 0)) reload(); });
+    return () => { offQueue(); offProg(); offDrop(); offImport(); offAvatar(); };
   }, [reload]);
 
   const searchTimer = useRef<number>();
@@ -161,55 +271,109 @@ export default function App() {
     searchTimer.current = window.setTimeout(() => Search(search.trim()).then((v) => setSearchResults(v || [])), 200);
   }, [search, version]);
 
-  const go = (r: Route) => { setRoute(r); setSearch(""); };
-  const play = (v: Video) => { setPlaying(v); MarkWatched(v.site, v.id); };
+  const [newColl, setNewColl] = useState(false);
+  const [gate, setGate] = useState<Collection | null>(null); // locked collection awaiting confirm
+  const [navOpen, setNavOpen] = useState(false); // mobile drawer
+
+  const go = (r: Route) => { setRoute(r); setSearch(""); setNavOpen(false); setPlaying(null); };
+  const play = (v: Video, list?: Video[]) => {
+    setPlaying(v);
+    setPlayQueue(list && list.length ? list : [v]);
+    MarkWatched(v.site, v.id);
+  };
+  const openCollection = (c: Collection) => {
+    if (c.locked) setGate(c);
+    else go({ kind: "collection", id: c.id, name: c.name });
+  };
 
   const activeDownloads = queue.filter((j) => j.status === "downloading" || j.status === "queued").length;
-  const totalVideos = models.reduce((n, m) => n + m.count, 0);
+  const totalVideos = videoTotal;
+  // Re-keys the main content so each route change replays the entrance animation.
+  const routeKey = route.kind + ("name" in route ? route.name : "") + ("id" in route ? String(route.id) : "") + ("label" in route ? route.label : ""); // distinct videos (a video tagged to 2 models isn't counted twice)
 
   return (
-    <div className="flex h-full" style={{ ["--ac" as any]: accent }}>
-      <nav className="w-56 shrink-0 bg-[#0d0d12]/95 border-r border-edge flex flex-col overflow-y-auto">
-        <div className="px-5 py-5 text-xl font-extrabold tracking-tight">
-          <span className="bg-gradient-to-r from-[#ff2d77] to-[#ff9000] bg-clip-text text-transparent">Media Vault</span>
+    <div className="flex h-full">
+      {navOpen && <div className="fixed inset-0 z-[45] bg-black/65 backdrop-blur-sm md:hidden" onClick={() => setNavOpen(false)} />}
+      <nav className={`fixed md:static inset-y-0 left-0 z-50 w-72 md:w-56 shrink-0 bg-panel md:bg-panel/90 border-r border-edge flex flex-col overflow-y-auto transition-transform duration-200 rounded-r-3xl md:rounded-none shadow-2xl shadow-black/50 md:shadow-none ${navOpen ? "translate-x-0" : "-translate-x-full"} md:translate-x-0`}
+        style={{ paddingTop: "env(safe-area-inset-top)" }}>
+        <div className="px-5 py-6 flex items-center gap-2.5">
+          <Swirl className="w-7 h-7 shrink-0" />
+          <span className="text-lg font-extrabold tracking-tight text-fg">Keepsake</span>
         </div>
 
-        <SideLabel>Library</SideLabel>
-        <SideItem active={route.kind === "library" || route.kind === "model"} onClick={() => go({ kind: "library" })}>▦ Models</SideItem>
-        <SideItem active={route.kind === "favorites"} onClick={() => go({ kind: "favorites" })}>❤ Favorites</SideItem>
-        <SideItem active={route.kind === "categories" || route.kind === "category"} onClick={() => go({ kind: "categories" })}>🏷️ Categories</SideItem>
-        <SideItem active={route.kind === "recent"} onClick={() => go({ kind: "recent" })}>🕑 Recently added</SideItem>
-        <SideItem active={route.kind === "watched"} onClick={() => go({ kind: "watched" })}>▶ Recently watched</SideItem>
+        <SideItem icon="home" active={route.kind === "home"} onClick={() => go({ kind: "home" })}>Home</SideItem>
+        <SideItem icon="feed" active={route.kind === "feed"} onClick={() => go({ kind: "feed" })}>Feed</SideItem>
+        <SideItem icon="people" active={route.kind === "library" || route.kind === "model"} onClick={() => go({ kind: "library" })}>People</SideItem>
 
-        <SideLabel>Get more</SideLabel>
-        <SideItem active={route.kind === "browse"} onClick={() => go({ kind: "browse" })}>✨ Sync</SideItem>
-        <SideItem active={route.kind === "downloads"} onClick={() => go({ kind: "downloads" })}>
-          ↓ Downloads {activeDownloads > 0 && <span style={{ color: "var(--ac)" }}>({activeDownloads})</span>}
+        <SideLabel>Browse</SideLabel>
+        <SideItem icon="heart" active={route.kind === "favorites"} onClick={() => go({ kind: "favorites" })}>Favorites</SideItem>
+        <SideItem icon="tag" active={route.kind === "categories" || route.kind === "category"} onClick={() => go({ kind: "categories" })}>Tags</SideItem>
+        <SideItem icon="clock" active={route.kind === "watched"} onClick={() => go({ kind: "watched" })}>History</SideItem>
+        <SideItem icon="plus" active={route.kind === "recent"} onClick={() => go({ kind: "recent" })}>Latest</SideItem>
+
+        <div className="flex items-center justify-between px-5 pt-4 pb-1">
+          <span className="text-[11px] uppercase tracking-wider text-muted/70">Collections</span>
+          <button onClick={() => setNewColl(true)} title="New collection" className="text-muted hover:text-fg text-sm leading-none">＋</button>
+        </div>
+        {collections.length === 0 && <div className="px-5 py-1 text-xs text-muted/60">None yet</div>}
+        {collections.map((c, i) => (
+          <SideItem key={c.id} icon={c.hidden ? "hidden" : "folder"} iconColor={collTint(i)}
+            active={route.kind === "collection" && route.id === c.id}
+            onClick={() => openCollection(c)}>
+            <span className="flex items-center gap-1.5 min-w-0">
+              <span className="truncate">{c.name}</span>
+              <span className="text-muted text-xs">{c.count}</span>
+              {c.locked && <Icon name="lock" className="w-3.5 h-3.5 text-muted shrink-0" />}
+            </span>
+          </SideItem>
+        ))}
+
+        <SideLabel>Manage</SideLabel>
+        <SideItem icon="spark" active={route.kind === "browse"} onClick={() => go({ kind: "browse" })}>Following</SideItem>
+        <SideItem icon="download" active={route.kind === "downloads"} onClick={() => go({ kind: "downloads" })}>
+          <span>Downloads {activeDownloads > 0 && <span style={{ color: "var(--ac)" }}>({activeDownloads})</span>}</span>
         </SideItem>
-        <SideItem active={route.kind === "settings"} onClick={() => go({ kind: "settings" })}>⚙ Settings</SideItem>
+        <SideItem icon="gear" active={route.kind === "settings"} onClick={() => go({ kind: "settings" })}>Settings</SideItem>
 
-        <div className="mt-auto px-5 py-4 text-xs text-muted">{totalVideos} videos · {models.length} models</div>
+        <div className="mt-auto px-5 py-4 text-xs text-muted">{totalVideos} videos · {models.length} people</div>
       </nav>
 
-      <main className="flex-1 min-w-0 overflow-y-auto">
-        {route.kind === "downloads" ? <Downloads queue={queue} />
+      <main className="flex-1 min-w-0 overflow-y-auto pb-24 md:pb-0">
+        <div className="md:hidden sticky top-0 z-20 glass border-b border-edge/70"
+          style={{ paddingTop: "env(safe-area-inset-top)" }}>
+          <div className="flex items-center gap-3 px-4 py-3">
+            <button onClick={() => setNavOpen(true)} aria-label="Open menu"
+              className="w-10 h-10 -ml-1.5 grid place-items-center rounded-full text-fg text-2xl leading-none active:bg-panel2">≡</button>
+            <span className="flex items-center gap-2 text-base font-extrabold tracking-tight text-fg">
+              <Swirl className="w-6 h-6" />Keepsake
+            </span>
+          </div>
+        </div>
+        <div key={routeKey} className="rise">
+        {route.kind === "home" ? <Home onPlay={play} onOpenModel={(name) => go({ kind: "model", name })} onGo={go} version={version} />
+          : route.kind === "feed" ? <Feed onOpenModel={(name) => go({ kind: "model", name })} onClose={() => go({ kind: "home" })} collections={collections} allLabels={allLabels} onChanged={reload} />
+          : route.kind === "downloads" ? <Downloads queue={queue} />
           : route.kind === "settings" ? <SettingsPage />
           : route.kind === "browse" ? <BrowseSync onEnqueued={() => go({ kind: "downloads" })} />
           : (
-            <div className="p-6">
-              <div className="flex items-center gap-4 mb-5">
-                {route.kind === "model" && <button onClick={() => go({ kind: "library" })} className="text-muted hover:text-white text-sm">← Models</button>}
-                {route.kind === "category" && <button onClick={() => go({ kind: "categories" })} className="text-muted hover:text-white text-sm">← Categories</button>}
-                <h1 className="text-xl font-semibold">
+            <div className="p-4 md:p-6">
+              <div className="flex items-center flex-wrap gap-3 md:gap-4 mb-5">
+                {route.kind === "model" && <button onClick={() => go({ kind: "library" })} className="text-muted hover:text-fg text-sm">← People</button>}
+                {route.kind === "category" && <button onClick={() => go({ kind: "categories" })} className="text-muted hover:text-fg text-sm">← Tags</button>}
+                <h1 className="text-xl font-bold flex items-center gap-2">
                   {searchResults !== null ? "Search"
-                    : route.kind === "model" ? modelLabel(route.name)
-                    : route.kind === "recent" ? "Recently added"
-                    : route.kind === "watched" ? "Recently watched"
+                    : route.kind === "model" ? null
+                    : route.kind === "recent" ? "Latest"
+                    : route.kind === "watched" ? "History"
                     : route.kind === "favorites" ? "Favorites"
-                    : route.kind === "categories" ? "Categories"
-                    : route.kind === "category" ? `🏷️ ${route.label}`
-                    : "Models"}
+                    : route.kind === "categories" ? "Tags"
+                    : route.kind === "category" ? <><Icon name="tag" className="w-5 h-5 text-accent" />{route.label}</>
+                    : route.kind === "collection" ? null
+                    : "People"}
                 </h1>
+                {searchResults === null && ["recent", "watched", "favorites", "category"].includes(route.kind) && videos.length > 0 && (
+                  <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-accent/15 text-accent">{videos.length}</span>
+                )}
                 {route.kind === "library" && searchResults === null && (
                   <div className="flex rounded-lg overflow-hidden border border-edge text-xs">
                     <FilterBtn on={siteFilter === "all"} onClick={() => setSiteFilter("all")}>All</FilterBtn>
@@ -218,25 +382,32 @@ export default function App() {
                   </div>
                 )}
                 <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search…"
-                  className="ml-auto w-64 bg-panel border border-edge rounded-lg px-4 py-2 text-sm outline-none focus:border-accent" />
+                  className="ml-auto w-full sm:w-64 bg-panel border border-edge rounded-lg px-4 py-2 text-sm outline-none focus:border-accent" />
               </div>
 
               {searchResults !== null
                 ? <VideoArea videos={searchResults} modelNames={modelNames} onPlay={play} onChanged={reload} />
                 : route.kind === "library"
                   ? <ModelGrid models={models.filter((m) => siteFilter === "all" || (m.sites || "").includes(siteFilter))}
-                      onOpen={(m) => go({ kind: "model", name: m.name })} />
+                      onOpen={(m) => go({ kind: "model", name: m.name })} onChanged={reload} />
                   : route.kind === "model"
                     ? <ModelPage name={route.name} version={version} modelNames={modelNames} onPlay={play} onChanged={reload} />
                     : route.kind === "categories"
                       ? <CategoriesView onOpen={(label) => go({ kind: "category", label })} />
-                      : <VideoArea videos={videos} modelNames={modelNames} onPlay={play} onChanged={reload} />}
+                      : route.kind === "collection"
+                        ? <CollectionPage coll={collections.find((c) => c.id === route.id) || { id: route.id, name: route.name, hidden: false, locked: false, count: 0, created: "" } as Collection}
+                            videos={videos} modelNames={modelNames} collections={collections} onPlay={play}
+                            onChanged={reload} onBack={() => go({ kind: "library" })} />
+                        : <VideoArea videos={videos} modelNames={modelNames} collections={collections} onPlay={play} onChanged={reload} />}
             </div>
           )}
+        </div>
       </main>
 
+      <TabBar route={route} onGo={go} onMore={() => setNavOpen(true)} navOpen={navOpen} />
+
       {importStatus && (
-        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-30 bg-panel border border-edge rounded-lg px-4 py-2 text-sm shadow-2xl">
+        <div className="fixed bottom-20 md:bottom-4 left-1/2 -translate-x-1/2 z-30 bg-panel border border-edge rounded-lg px-4 py-2 text-sm shadow-2xl">
           {importStatus.finished
             ? <span className="text-emerald-400">Imported {importStatus.total} file{importStatus.total === 1 ? "" : "s"} ✓</span>
             : <span>Importing {importStatus.done}/{importStatus.total}… <span className="text-muted">{importStatus.name || ""}</span></span>}
@@ -244,9 +415,29 @@ export default function App() {
       )}
 
       {playing && (
-        <WatchPage key={playing.site + "/" + playing.id} video={playing} allLabels={allLabels} modelNames={modelNames}
-          onClose={() => setPlaying(null)} onPlay={play} onChanged={reload}
+        <WatchPage key={playing.site + "/" + playing.id} video={playing} queue={playQueue} allLabels={allLabels} modelNames={modelNames}
+          collections={collections} onClose={() => setPlaying(null)} onPlay={play} onChanged={reload}
           onOpenModel={(name) => { setPlaying(null); go({ kind: "model", name }); }} />
+      )}
+
+      {newColl && (
+        <NewCollectionModal onClose={() => setNewColl(false)}
+          onCreated={(id, name) => { setNewColl(false); reload(); go({ kind: "collection", id, name }); }} />
+      )}
+
+      {gate && (
+        <div className="fixed inset-0 bg-black/65 backdrop-blur-sm z-50 grid place-items-center p-4" onClick={() => setGate(null)}>
+          <div className="bg-panel border border-edge rounded-xl p-6 w-[92vw] max-w-[22rem] text-center pop" onClick={(e) => e.stopPropagation()}>
+            <div className="text-3xl mb-2">🔒</div>
+            <div className="font-semibold mb-1">{gate.name} is locked</div>
+            <p className="text-xs text-muted mb-4">This collection is kept private. Open it for this session?</p>
+            <div className="flex justify-center gap-2">
+              <button onClick={() => setGate(null)} className="text-sm text-muted hover:text-fg px-3 py-2">Cancel</button>
+              <button onClick={() => { const c = gate; setGate(null); go({ kind: "collection", id: c.id, name: c.name }); }}
+                style={{ background: "var(--ac)", color: "var(--ac-ink)" }} className="text-sm font-semibold px-4 py-2 rounded-lg">Open</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -255,43 +446,284 @@ export default function App() {
 function SideLabel({ children }: any) {
   return <div className="px-5 pt-4 pb-1 text-[11px] uppercase tracking-wider text-muted/70">{children}</div>;
 }
-function SideItem({ active, onClick, children }: any) {
+function SideItem({ icon, iconColor, active, onClick, children }: any) {
   return (
-    <button onClick={onClick} style={active ? { borderColor: "var(--ac)" } : undefined}
-      className={`text-left px-5 py-2.5 text-sm font-medium transition border-l-2 ${active ? "bg-panel2 text-white" : "border-transparent text-muted hover:text-white hover:bg-panel2/50"}`}>
+    <button onClick={onClick}
+      className={`text-left mx-2 px-3.5 py-2.5 rounded-full text-sm transition flex items-center gap-2.5 ${
+        active
+          ? "bg-accent/20 text-fg font-bold"
+          : "text-muted font-medium hover:text-fg hover:bg-panel2"
+      }`}>
+      {icon && (
+        <span className="shrink-0 leading-none" style={iconColor && !active ? { color: iconColor } : undefined}>
+          <Icon name={icon} className={`w-[18px] h-[18px] ${active ? "text-accent" : ""}`} />
+        </span>
+      )}
       {children}
     </button>
   );
 }
 function FilterBtn({ on, onClick, children }: any) {
-  return <button onClick={onClick} style={on ? { background: "var(--ac)", color: "#0a0a0a" } : undefined}
-    className={`px-3 py-1.5 ${on ? "font-semibold" : "bg-panel text-muted hover:text-white"}`}>{children}</button>;
+  return <button onClick={onClick} style={on ? { background: "var(--ac)", color: "var(--ac-ink)" } : undefined}
+    className={`px-3 py-1.5 ${on ? "font-semibold" : "bg-panel text-muted hover:text-fg"}`}>{children}</button>;
 }
 
-/* ---------------- Models grid ---------------- */
+/* ---------------- Home (discovery wall) ---------------- */
 
-function ModelGrid({ models, onOpen }: { models: Model[]; onOpen: (m: Model) => void }) {
-  if (!models.length) return <Empty>No models yet — download something or sort the Unassigned bucket.</Empty>;
+function Home({ onPlay, onOpenModel, onGo, version }:
+  { onPlay: (v: Video, list?: Video[]) => void; onOpenModel: (name: string) => void; onGo: (r: Route) => void; version: number }) {
+  const [recent, setRecent] = useState<Video[]>([]);
+  const [cont, setCont] = useState<Video[]>([]);
+  const [favs, setFavs] = useState<Video[]>([]);
+  const [people, setPeople] = useState<Model[]>([]);
+  const [hero, setHero] = useState<Video | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    Promise.all([RecentlyDownloaded(), ContinueWatching(), Favorites(), Models()]).then(([r, c, f, m]) => {
+      if (!alive) return;
+      setRecent(r || []); setCont(c || []); setFavs(f || []); setPeople(m || []);
+      setLoading(false);
+    });
+    return () => { alive = false; };
+  }, [version]);
+
+  // De-duped pool across favorites/in-progress/recent for the hero + shuffle.
+  const pool = useMemo(() => {
+    const seen = new Set<string>(); const out: Video[] = [];
+    for (const v of [...favs, ...cont, ...recent]) {
+      const k = v.site + "/" + v.id;
+      if (!seen.has(k)) { seen.add(k); out.push(v); }
+    }
+    return out;
+  }, [favs, cont, recent]);
+
+  // Pick a hero once data arrives (a favorite if any, else a recent), keep it stable.
+  useEffect(() => {
+    if (hero || pool.length === 0) return;
+    const top = favs.length ? favs : recent;
+    if (top.length) setHero(top[Math.floor(Math.random() * top.length)]);
+  }, [pool, favs, recent, hero]);
+
+  const shuffle = () => { if (pool.length) onPlay(pool[Math.floor(Math.random() * pool.length)], pool); };
+
+  if (loading) return <HomeSkeleton />;
+  if (!pool.length && !people.length)
+    return <div className="p-6"><Empty icon="🍦">Nothing here yet — follow someone or add a download and the wall fills itself.</Empty></div>;
+
+  const topPeople = people.filter((p) => p.name).slice(0, 18);
+
   return (
-    <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(210px,1fr))" }}>
-      {models.map((m) => (
-        <div key={m.name || "__unassigned"} onClick={() => onOpen(m)} className="tile group">
-          <div className="aspect-[4/5]">
-            {m.thumbnail
-              ? <img src={mediaURL(m.thumbnail)} loading="lazy" decoding="async" className="w-full h-full object-cover" />
-              : <div className="w-full h-full grid place-items-center text-muted text-4xl bg-panel2">▦</div>}
-          </div>
-          <div className="overlay" />
-          <div className="absolute top-2 left-2"><SiteTags sites={m.sites} /></div>
-          <div className="absolute bottom-0 left-0 right-0 p-3">
-            <div className={`font-semibold truncate drop-shadow ${m.name ? "" : "text-amber-400"}`}>{modelLabel(m.name)}</div>
-            <div className="text-xs text-white/65 mt-0.5">
-              {m.count} video{m.count === 1 ? "" : "s"}{m.totalSeconds ? ` · ${fmtTotal(m.totalSeconds)}` : ""}{m.bytes ? ` · ${fmtSize(m.bytes)}` : ""}
+    <div className="pb-10">
+      <div className="px-4 md:px-9 pt-4 md:pt-5 flex items-baseline gap-2.5 flex-wrap">
+        <span className="text-2xl leading-none">{flavorEmoji()}</span>
+        <span className="text-xl font-extrabold tracking-tight text-fg">{greeting()}</span>
+        <span className="text-sm font-semibold text-muted">here's what's fresh.</span>
+      </div>
+      {hero && <Hero v={hero} onPlay={(v) => onPlay(v, pool)} onShuffle={shuffle} />}
+      <div className="mt-6 space-y-8">
+        {cont.length > 0 && (
+          <Row title="Continue watching" onSeeAll={() => onGo({ kind: "watched" })}>
+            {cont.slice(0, 18).map((v) => (
+              <RowCard key={v.site + v.id} v={v}
+                progress={v.position && v.duration ? Math.min(1, v.position / v.duration) : 0}
+                onClick={() => onPlay(v, cont)} />
+            ))}
+          </Row>
+        )}
+        {topPeople.length > 0 && (
+          <section>
+            <RowHeader title="Top people" onSeeAll={() => onGo({ kind: "library" })} />
+            <div className="row flex gap-4 overflow-x-auto px-4 md:px-8 pt-2 pb-3">
+              {topPeople.map((p) => (
+                <button key={p.name} onClick={() => onOpenModel(p.name)} className="shrink-0 w-[104px] text-center">
+                  <div className="avatar w-[96px] h-[96px] mx-auto">
+                    {p.thumbnail
+                      ? <img src={mediaURL(p.thumbnail)} loading="lazy" className="w-full h-full object-cover" />
+                      : <div className="w-full h-full grid place-items-center text-2xl text-muted">{(p.name[0] || "?").toUpperCase()}</div>}
+                  </div>
+                  <div className="text-xs font-semibold mt-2 truncate">{p.name}</div>
+                  <div className="text-[11px] text-muted">{p.count} video{p.count === 1 ? "" : "s"}</div>
+                </button>
+              ))}
             </div>
+          </section>
+        )}
+        {recent.length > 0 && (
+          <Row title="Newly added" onSeeAll={() => onGo({ kind: "recent" })}>
+            {recent.slice(0, 18).map((v) => <RowCard key={v.site + v.id} v={v} onClick={() => onPlay(v, recent)} />)}
+          </Row>
+        )}
+        {favs.length > 0 && (
+          <Row title="Your favorites" onSeeAll={() => onGo({ kind: "favorites" })}>
+            {favs.slice(0, 18).map((v) => <RowCard key={v.site + v.id} v={v} onClick={() => onPlay(v, favs)} />)}
+          </Row>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Hero({ v, onPlay, onShuffle }: { v: Video; onPlay: (v: Video) => void; onShuffle: () => void }) {
+  return (
+    <div className="px-3 md:px-8 pt-3 md:pt-4">
+      <div className="relative h-[40vh] min-h-[280px] md:h-[52vh] w-full overflow-hidden rounded-blob md:rounded-[2rem] shadow-xl shadow-black/45">
+        {v.thumbnail
+          ? <img src={mediaURL(v.thumbnail)} className="absolute inset-0 w-full h-full object-cover" />
+          : <div className="absolute inset-0 bg-panel2" />}
+        <div className="hero-scrim" />
+        <div className="absolute bottom-0 left-0 right-0 p-5 md:p-10 max-w-3xl">
+          <span className="swirl-chip inline-block text-[10px] uppercase tracking-widest font-extrabold mb-2.5 px-2.5 py-1 rounded-full">Featured</span>
+          <h1 className="text-2xl md:text-4xl font-extrabold leading-tight line-clamp-2 cap text-white">{v.title || v.uploader}</h1>
+          <div className="text-sm text-white/80 mt-2 cap">
+            {v.models && v.models.length ? v.models.join(", ") : UNASSIGNED}
+            {v.height ? ` · ${v.height}p` : ""}{v.duration ? ` · ${fmtDur(v.duration)}` : ""}
+          </div>
+          <div className="flex gap-3 mt-5">
+            <button onClick={() => onPlay(v)} className="glow-btn px-6 py-2.5 text-sm flex items-center gap-2">▶ Play</button>
+            <button onClick={onShuffle} className="px-5 py-2.5 text-sm font-semibold rounded-full glass text-fg flex items-center gap-2 hover:bg-panel">⤮ Shuffle</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RowHeader({ title, onSeeAll }: { title: string; onSeeAll?: () => void }) {
+  return (
+    <div className="flex items-center justify-between px-4 md:px-8 mb-3">
+      <h2 className="text-lg font-bold tracking-tight flex items-center gap-2">
+        <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />{title}
+      </h2>
+      {onSeeAll && <button onClick={onSeeAll} className="text-xs text-muted hover:text-fg">See all →</button>}
+    </div>
+  );
+}
+
+function Row({ title, onSeeAll, children }: { title: string; onSeeAll?: () => void; children: any }) {
+  return (
+    <section>
+      <RowHeader title={title} onSeeAll={onSeeAll} />
+      <div className="row flex gap-3 md:gap-4 overflow-x-auto px-4 md:px-8 pt-2 pb-3">{children}</div>
+    </section>
+  );
+}
+
+function RowCard({ v, onClick, progress }: { v: Video; onClick: () => void; progress?: number }) {
+  return (
+    <button onClick={onClick} className="tile shrink-0 w-[230px] md:w-[260px] text-left">
+      <PreviewMedia v={v} ratio="aspect-video" />
+      <div className="overlay" />
+      <div className="absolute top-2 left-2 flex items-center gap-1.5">
+        <span className="bg-black/50 text-white backdrop-blur-sm rounded-md px-1.5 py-0.5"><SourceBadge site={v.site} /></span>
+        {isNew(v.added) && <span className="swirl-chip text-[10px] font-extrabold px-2 py-0.5 rounded-full">NEW</span>}
+      </div>
+      {v.duration ? <span className="absolute top-2 right-2 bg-black/75 text-white text-[11px] px-1.5 py-0.5 rounded">{fmtDur(v.duration)}</span> : null}
+      <div className="playbtn"><span className="w-12 h-12 grid place-items-center rounded-full glass text-fg text-lg">▶</span></div>
+      <div className="absolute bottom-0 left-0 right-0 p-3">
+        <div className="text-sm font-semibold line-clamp-1 text-white cap">{v.favorite ? <span className="text-rose-300">❤ </span> : null}{v.title || v.uploader}</div>
+        <div className="text-[11px] text-white/80 mt-0.5 truncate cap">{v.models && v.models.length ? v.models.join(", ") : UNASSIGNED}</div>
+      </div>
+      {progress != null && progress > 0 && <div className="progress"><i style={{ width: `${Math.round(progress * 100)}%` }} /></div>}
+    </button>
+  );
+}
+
+// PreviewMedia shows the thumbnail, then silently plays a muted clip on hover
+// after a short delay — desktop pointers only. On touch screens a tap simply
+// opens the video: no long-press previews, no hidden full-size video loads.
+function PreviewMedia({ v, ratio }: { v: Video; ratio: string }) {
+  const [preview, setPreview] = useState(false);
+  const timer = useRef<number | undefined>(undefined);
+  const start = () => { if (!CAN_HOVER || localStorage.hoverPreview === "0") return; timer.current = window.setTimeout(() => setPreview(true), 450); };
+  const stop = () => { window.clearTimeout(timer.current); setPreview(false); };
+  return (
+    <div className={`relative ${ratio}`} onMouseEnter={start} onMouseLeave={stop}>
+      {v.thumbnail
+        ? <img src={mediaURL(v.thumbnail)} loading="lazy" decoding="async" className="w-full h-full object-cover" />
+        : <div className="w-full h-full grid place-items-center text-muted text-3xl bg-panel2">▶</div>}
+      {preview && v.filepath && (
+        <video src={videoURL(v.filepath)} autoPlay muted loop playsInline
+          className="absolute inset-0 w-full h-full object-cover" />
+      )}
+    </div>
+  );
+}
+
+function HomeSkeleton() {
+  return (
+    <div className="pb-10">
+      <div className="px-3 md:px-8 pt-3 md:pt-6"><div className="skel h-[40vh] min-h-[280px] md:h-[52vh]" /></div>
+      {[0, 1].map((r) => (
+        <div key={r} className="mt-8">
+          <div className="skel h-5 w-40 mx-4 md:mx-8 mb-3" />
+          <div className="flex gap-4 px-4 md:px-8 overflow-hidden">
+            {Array.from({ length: 6 }).map((_, i) => <div key={i} className="skel shrink-0 w-[260px] aspect-video" />)}
           </div>
         </div>
       ))}
     </div>
+  );
+}
+
+/* ---------------- Models grid ---------------- */
+
+function ModelGrid({ models, onOpen, onChanged }: { models: Model[]; onOpen: (m: Model) => void; onChanged: () => void }) {
+  const [selectMode, setSelectMode] = useState(false);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  if (!models.length) return <Empty icon="🍨">No people yet — download something and they'll show up here.</Empty>;
+
+  const toggle = (name: string) => setPicked((p) => { const n = new Set(p); n.has(name) ? n.delete(name) : n.add(name); return n; });
+  const exit = () => { setSelectMode(false); setPicked(new Set()); };
+  const unassignPicked = async () => {
+    if (!picked.size) return;
+    setBusy(true);
+    for (const name of picked) await UnassignModel(name);
+    setBusy(false); exit(); onChanged();
+  };
+
+  return (
+    <>
+      <div className="flex items-center gap-3 mb-3 text-sm">
+        {!selectMode
+          ? <button onClick={() => setSelectMode(true)} className="text-muted hover:text-fg">Select</button>
+          : <>
+              <span className="text-muted">{picked.size} selected</span>
+              <button onClick={unassignPicked} disabled={!picked.size || busy}
+                className="font-medium px-3 py-1.5 rounded-lg text-xs bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-40">
+                Move videos to Unsorted
+              </button>
+              <button onClick={exit} className="text-muted hover:text-fg text-xs">Cancel</button>
+            </>}
+        {selectMode && <span className="text-muted text-xs">Pick the people to clear — their videos move to Unsorted and they disappear from this page.</span>}
+      </div>
+    <div className="grid gap-x-4 gap-y-6 md:gap-y-7" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(96px,26vw,150px),1fr))" }}>
+      {models.map((m) => {
+        const canSelect = selectMode && !!m.name; // can't unassign the Unassigned bucket
+        const sel = picked.has(m.name);
+        return (
+        <button key={m.name || "__unassigned"} onClick={() => (canSelect ? toggle(m.name) : selectMode ? undefined : onOpen(m))}
+          className={`flex flex-col items-center text-center ${selectMode && !m.name ? "opacity-40" : ""}`}>
+          <div className="avatar w-full aspect-square relative"
+            style={sel ? { boxShadow: "0 0 0 3px var(--ac), 0 14px 30px rgba(0,0,0,.55)" } : undefined}>
+            {m.thumbnail
+              ? <img src={mediaURL(m.thumbnail)} loading="lazy" decoding="async" className="w-full h-full object-cover" />
+              : <div className="w-full h-full grid place-items-center text-3xl text-muted">{m.name ? m.name[0].toUpperCase() : "★"}</div>}
+            {canSelect && (
+              <span className={`absolute top-1 right-1 w-6 h-6 grid place-items-center rounded-full text-sm font-bold ${sel ? "" : "border-2 border-white/70 bg-black/40"}`}
+                style={sel ? { background: "var(--ac)", color: "var(--ac-ink)" } : undefined}>{sel ? "✓" : ""}</span>
+            )}
+          </div>
+          <div className={`font-semibold text-sm mt-2.5 truncate w-full px-1 ${m.name ? "text-fg" : "text-accent"}`}>{modelLabel(m.name)}</div>
+          <div className="text-[11px] text-muted">{m.count} video{m.count === 1 ? "" : "s"}</div>
+        </button>
+        );
+      })}
+    </div>
+    </>
   );
 }
 
@@ -300,7 +732,7 @@ function ModelGrid({ models, onOpen }: { models: Model[]; onOpen: (m: Model) => 
 function CategoriesView({ onOpen }: { onOpen: (label: string) => void }) {
   const [cats, setCats] = useState<library.LabelCount[]>([]);
   useEffect(() => { LabelCounts().then((c) => setCats(c || [])); }, []);
-  if (!cats.length) return <Empty>No categories yet — open a video and add tags to start categorizing.</Empty>;
+  if (!cats.length) return <Empty icon="🏷️">No tags yet — open any video and add a tag to start sorting by mood.</Empty>;
   return (
     <div className="flex flex-wrap gap-3">
       {cats.map((c) => (
@@ -314,18 +746,157 @@ function CategoriesView({ onOpen }: { onOpen: (label: string) => void }) {
   );
 }
 
+/* ---------------- Collections ---------------- */
+
+function NewCollectionModal({ onClose, onCreated }: { onClose: () => void; onCreated: (id: number, name: string) => void }) {
+  const [name, setName] = useState("");
+  const [hidden, setHidden] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const create = async () => {
+    const n = name.trim();
+    if (!n) return;
+    setBusy(true);
+    const id = await CreateCollection(n, hidden);
+    onCreated(id, n);
+  };
+  return (
+    <div className="fixed inset-0 bg-black/65 backdrop-blur-sm z-50 grid place-items-center p-4" onClick={onClose}>
+      <div className="bg-panel border border-edge rounded-xl p-5 w-[92vw] max-w-[24rem]" onClick={(e) => e.stopPropagation()}>
+        <div className="font-semibold mb-3">New collection</div>
+        <input value={name} autoFocus onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") create(); }} placeholder="e.g. Private, Travel 2026, Memes…"
+          className="w-full bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent mb-3" />
+        <label className="flex items-start gap-2 text-sm mb-1 cursor-pointer">
+          <input type="checkbox" checked={hidden} onChange={(e) => setHidden(e.target.checked)} className="mt-1 accent-[color:var(--ac)]" />
+          <span>Hidden<span className="block text-xs text-muted">Its videos won't show in the library, search, or model grids — only on this collection's page.</span></span>
+        </label>
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onClose} className="text-sm text-muted hover:text-fg px-3 py-2">Cancel</button>
+          <button onClick={create} disabled={busy || !name.trim()} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+            className="text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50">Create</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// AddToCollectionModal toggles membership of one or more videos across collections.
+function AddToCollectionModal({ refs, collections, onClose, onChanged }:
+  { refs: { site: string; id: string }[]; collections: Collection[]; onClose: () => void; onChanged: () => void }) {
+  const [picked, setPicked] = useState<Set<number>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const single = refs.length === 1;
+
+  // For a single video, preselect the collections it's already in.
+  useEffect(() => {
+    if (single) CollectionsForVideo(refs[0].site, refs[0].id).then((ids) => setPicked(new Set(ids || [])));
+  }, []);
+
+  const toggle = (id: number) => setPicked((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const save = async () => {
+    setBusy(true);
+    for (const c of collections) {
+      const want = picked.has(c.id);
+      // Single video: sync exact membership. Bulk: only add to picked (never remove).
+      if (want) await Promise.all(refs.map((r) => AddToCollection(c.id, r.site, r.id)));
+      else if (single) await RemoveFromCollection(c.id, refs[0].site, refs[0].id);
+    }
+    onChanged();
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/65 backdrop-blur-sm z-50 grid place-items-center p-4" onClick={onClose}>
+      <div className="bg-panel border border-edge rounded-xl p-5 w-[92vw] max-w-[24rem]" onClick={(e) => e.stopPropagation()}>
+        <div className="font-semibold mb-1">{single ? "Add to collections" : `Add ${refs.length} videos to…`}</div>
+        <p className="text-xs text-muted mb-3">{single ? "Tick the collections this video belongs to." : "Ticked collections get these videos added."}</p>
+        {collections.length === 0
+          ? <p className="text-sm text-muted py-2">No collections yet — create one from the sidebar.</p>
+          : (
+            <div className="space-y-1 max-h-64 overflow-y-auto mb-2">
+              {collections.map((c, i) => (
+                <label key={c.id} className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-panel2 cursor-pointer">
+                  <input type="checkbox" checked={picked.has(c.id)} onChange={() => toggle(c.id)} className="w-4 h-4 accent-[color:var(--ac)]" />
+                  <span className="text-sm flex items-center gap-2 min-w-0">
+                    <span style={{ color: collTint(i) }}><Icon name={c.hidden ? "hidden" : "folder"} className="w-4 h-4" /></span>
+                    <span className="truncate">{c.name}</span>
+                    {c.locked && <Icon name="lock" className="w-3.5 h-3.5 text-muted shrink-0" />}
+                  </span>
+                  <span className="ml-auto text-xs text-muted">{c.count}</span>
+                </label>
+              ))}
+            </div>
+          )}
+        <div className="flex justify-end gap-2 mt-3">
+          <button onClick={onClose} className="text-sm text-muted hover:text-fg px-3 py-2">Cancel</button>
+          <button onClick={save} disabled={busy || !collections.length} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+            className="text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50">Done</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CollectionPage({ coll, videos, modelNames, collections, onPlay, onChanged, onBack }:
+  { coll: Collection; videos: Video[]; modelNames: string[]; collections: Collection[];
+    onPlay: (v: Video) => void; onChanged: () => void; onBack: () => void }) {
+  const [renaming, setRenaming] = useState(false);
+  const [name, setName] = useState(coll.name);
+
+  const saveName = async () => {
+    const n = name.trim(); setRenaming(false);
+    if (n && n !== coll.name) { await RenameCollection(coll.id, n); onChanged(); }
+  };
+  const toggleHidden = async () => { await SetCollectionHidden(coll.id, !coll.hidden); onChanged(); };
+  const toggleLocked = async () => { await SetCollectionLocked(coll.id, !coll.locked); onChanged(); };
+  const del = async () => {
+    if (!window.confirm(`Delete the collection "${coll.name}"? Your videos stay in the library.`)) return;
+    await DeleteCollection(coll.id); onChanged(); onBack();
+  };
+
+  return (
+    <>
+      <div className="flex items-center gap-3 mb-5 flex-wrap">
+        <button onClick={onBack} className="text-muted hover:text-fg text-sm">← Library</button>
+        {renaming
+          ? <input value={name} autoFocus onChange={(e) => setName(e.target.value)} onBlur={saveName}
+              onKeyDown={(e) => { if (e.key === "Enter") saveName(); if (e.key === "Escape") setRenaming(false); }}
+              className="text-xl font-semibold bg-panel2 border border-edge rounded px-2 py-1 outline-none focus:border-accent" />
+          : <h1 onClick={() => { setName(coll.name); setRenaming(true); }} className="text-xl font-bold cursor-text flex items-center gap-2">
+              <Icon name={coll.hidden ? "hidden" : "folder"} className="w-5 h-5 text-accent" />{coll.name} <span className="text-muted text-sm">✎</span>
+            </h1>}
+        <span className="text-muted text-sm">{videos.length} video{videos.length === 1 ? "" : "s"}</span>
+        <div className="ml-auto flex items-center gap-2 text-xs">
+          <button onClick={toggleHidden} className={`px-3 py-1.5 rounded-lg font-medium ${coll.hidden ? "bg-edge text-fg" : "bg-edge text-muted hover:text-fg"}`}>
+            {coll.hidden ? "🙈 Hidden" : "👁 Visible"}
+          </button>
+          <button onClick={toggleLocked} className={`px-3 py-1.5 rounded-lg font-medium ${coll.locked ? "bg-edge text-fg" : "bg-edge text-muted hover:text-fg"}`}>
+            {coll.locked ? "🔒 Locked" : "🔓 Unlocked"}
+          </button>
+          <button onClick={del} className="px-3 py-1.5 rounded-lg font-medium bg-edge text-muted hover:text-rose-400">Delete</button>
+        </div>
+      </div>
+      {coll.hidden && <p className="text-xs text-muted mb-4 -mt-2">This collection is hidden — its videos stay out of the library, search, and model grids.</p>}
+      <VideoArea videos={videos} modelNames={modelNames} collections={collections} collectionId={coll.id} onPlay={onPlay} onChanged={onChanged} />
+    </>
+  );
+}
+
 /* ---------------- Model page (photos + videos) ---------------- */
 
 function ModelPage({ name, version, modelNames, onPlay, onChanged }:
-  { name: string; version: number; modelNames: string[]; onPlay: (v: Video) => void; onChanged: () => void }) {
+  { name: string; version: number; modelNames: string[]; onPlay: (v: Video, list?: Video[]) => void; onChanged: () => void }) {
   const [videos, setVideos] = useState<Video[]>([]);
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [lightbox, setLightbox] = useState<number | null>(null);
   const [info, setInfo] = useState<ModelInfo | null>(null);
   const [editing, setEditing] = useState(false);
+  const [avatarOpen, setAvatarOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   const load = useCallback(() => {
-    VideosByModel(name).then((v) => setVideos(v || []));
+    setLoading(true);
+    VideosByModel(name).then((v) => { setVideos(v || []); setLoading(false); });
     PhotosByModel(name).then((p) => setPhotos(p || []));
     if (name) GetModelInfo(name).then(setInfo); else setInfo(null);
   }, [name]);
@@ -333,29 +904,56 @@ function ModelPage({ name, version, modelNames, onPlay, onChanged }:
   useEffect(() => { const off = EventsOn("import", (s: any) => { if (s.finished) load(); }); return () => { off(); }; }, [load]);
   const changed = () => { load(); onChanged(); };
 
+  const avatar = info?.cover || videos[0]?.thumbnail || "";
+  const totalSecs = videos.reduce((s, v) => s + (v.duration || 0), 0);
+  const totalBytes = videos.reduce((s, v) => s + (v.filesize || 0), 0);
+  const sites = Array.from(new Set(videos.map((v) => v.site)));
+
   return (
     <>
       {name && (
-        <div className="flex gap-5 mb-6">
-          {info?.cover && <img src={mediaURL(info.cover)} className="w-36 aspect-[3/4] object-cover rounded-xl shrink-0" />}
-          <div className="flex-1 min-w-0">
-            {info?.bio && <p className="text-sm text-white/80 whitespace-pre-wrap mb-3">{info.bio}</p>}
-            {info && info.links && info.links.length > 0 && (
-              <div className="flex flex-wrap gap-2 mb-3">
-                {info.links.map((l, i) => (
-                  <button key={i} onClick={() => BrowserOpenURL(l.url)} style={{ background: "var(--ac)", color: "#0a0a0a" }}
-                    className="text-xs font-semibold px-3 py-1.5 rounded-full">{l.label} ↗</button>
-                ))}
+        <section className="relative overflow-hidden rounded-2xl border border-edge mb-6">
+          {avatar && <img src={mediaURL(avatar)} aria-hidden className="absolute inset-0 w-full h-full object-cover opacity-25 blur-2xl scale-125" />}
+          <div className="absolute inset-0 bg-gradient-to-t from-ink via-ink/85 to-ink/50" />
+          <div className="relative p-5 md:p-8 flex flex-col md:flex-row items-center md:items-end gap-5 md:gap-7">
+            <button onClick={() => setAvatarOpen(true)} title="Change avatar"
+              className="avatar relative w-28 h-28 md:w-40 md:h-40 shrink-0 group">
+              {avatar
+                ? <img src={mediaURL(avatar)} className="w-full h-full object-cover" />
+                : <div className="w-full h-full grid place-items-center text-4xl text-muted">{(name[0] || "?").toUpperCase()}</div>}
+              <span className="absolute inset-0 bg-black/45 opacity-0 group-hover:opacity-100 grid place-items-center text-white text-xs font-semibold transition">✎ Edit</span>
+            </button>
+            <div className="flex-1 min-w-0 text-center md:text-left">
+              <h1 className="text-2xl md:text-4xl font-extrabold tracking-tight">{name}</h1>
+              <div className="text-sm text-muted mt-1.5 flex flex-wrap gap-x-2 gap-y-1 justify-center md:justify-start items-center">
+                <span>{videos.length} video{videos.length === 1 ? "" : "s"}</span>
+                {totalSecs ? <><span>·</span><span>{fmtTotal(totalSecs)}</span></> : null}
+                {totalBytes ? <><span>·</span><span>{fmtSize(totalBytes)}</span></> : null}
+                {sites.length > 0 && <><span>·</span><span className="inline-flex gap-2 items-center">{sites.map((sname) => <SourceBadge key={sname} site={sname} />)}</span></>}
               </div>
-            )}
-            <button onClick={() => setEditing(true)} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-edge hover:bg-panel2">Edit profile</button>
+              {info?.bio && <p className="text-sm text-fg/80 whitespace-pre-wrap mt-3 max-w-2xl">{info.bio}</p>}
+              {info && info.links && info.links.length > 0 && (
+                <div className="flex flex-wrap gap-2 mt-3 justify-center md:justify-start">
+                  {info.links.map((l, i) => (
+                    <button key={i} onClick={() => BrowserOpenURL(l.url)} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-full">{l.label} ↗</button>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-wrap gap-2 mt-4 justify-center md:justify-start">
+                {videos.length > 0 && <button onClick={() => onPlay(videos[0], videos)} className="glow-btn px-5 py-2 text-sm flex items-center gap-2">▶ Play all</button>}
+                {videos.length > 0 && <button onClick={() => onPlay(videos[Math.floor(Math.random() * videos.length)], videos)} className="px-4 py-2 text-sm font-semibold rounded-xl bg-panel2 hover:bg-edge text-fg border border-edge flex items-center gap-1.5">⤮ Shuffle</button>}
+                <button onClick={() => setAvatarOpen(true)} className="px-4 py-2 text-sm font-medium rounded-xl bg-panel2 hover:bg-edge text-fg border border-edge">Edit avatar</button>
+                <button onClick={() => setEditing(true)} className="px-4 py-2 text-sm font-medium rounded-xl bg-panel2 hover:bg-edge text-fg border border-edge">Edit profile</button>
+              </div>
+            </div>
           </div>
-        </div>
+        </section>
       )}
 
       <div className="flex items-center gap-3 mb-3">
         <h2 className="text-sm font-semibold text-muted">Photos{photos.length ? ` (${photos.length})` : ""}</h2>
-        <button onClick={() => ImportPhotosDialog(name)} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-edge hover:bg-panel2">Add photos…</button>
+        <button onClick={() => ImportPhotosDialog(name)} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">Add photos…</button>
       </div>
       {photos.length > 0 && (
         <div className="flex gap-2 overflow-x-auto pb-3 mb-6">
@@ -365,13 +963,69 @@ function ModelPage({ name, version, modelNames, onPlay, onChanged }:
           ))}
         </div>
       )}
-      <VideoArea videos={videos} modelNames={modelNames} onPlay={onPlay} onChanged={changed} />
+      {loading ? <CardGridSkeleton /> : <VideoArea videos={videos} modelNames={modelNames} onPlay={onPlay} onChanged={changed} />}
       {lightbox !== null && (
         <Lightbox photos={photos} index={lightbox} onIndex={setLightbox} onClose={() => setLightbox(null)}
           onSetCover={name ? (p) => { SetModelCover(name, p.filepath).then(changed); setLightbox(null); } : undefined} />
       )}
       {editing && info && <ProfileEditor info={info} onClose={() => setEditing(false)} onSaved={() => { setEditing(false); load(); onChanged(); }} />}
+      {avatarOpen && <AvatarEditor name={name} videos={videos} onClose={() => setAvatarOpen(false)} onSaved={changed} />}
     </>
+  );
+}
+
+// AvatarEditor sets a model's profile picture: upload a file, paste an image URL,
+// or pick a frame from one of their videos.
+function AvatarEditor({ name, videos, onClose, onSaved }:
+  { name: string; videos: Video[]; onClose: () => void; onSaved: () => void }) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const fileRef = useRef<HTMLInputElement>(null);
+  const done = () => { setBusy(false); onSaved(); onClose(); };
+  const fail = (m: string) => { setBusy(false); setErr(m); };
+  const fromUrl = async () => { if (!url.trim()) return; setBusy(true); setErr(""); try { await SetAvatarFromURL(name, url.trim()); done(); } catch { fail("Couldn't fetch that image URL."); } };
+  const fromPornhub = async () => { setBusy(true); setErr(""); try { const r = await FetchAvatar(name); if (r.set) done(); else fail("No Pornhub profile picture found — try upload, a URL, or a video frame."); } catch { fail("Couldn't reach Pornhub."); } };
+  const fromFile = async (f?: File) => { if (!f) return; setBusy(true); setErr(""); try { await UploadAvatar(name, f); done(); } catch { fail("Upload failed."); } };
+  const fromVideo = async (v: Video) => { if (!v.thumbnail) return; setBusy(true); setErr(""); try { await SetModelCover(name, v.thumbnail); done(); } catch { fail("Couldn't set that frame."); } };
+  const withThumb = videos.filter((v) => v.thumbnail);
+
+  return (
+    <div className="fixed inset-0 bg-black/65 backdrop-blur-sm z-50 grid place-items-center p-4" onClick={onClose}>
+      <div className="bg-panel border border-edge rounded-xl p-5 w-[92vw] max-w-[34rem] max-h-[85vh] overflow-y-auto pop" onClick={(e) => e.stopPropagation()}>
+        <div className="font-semibold mb-3">Set {name}'s avatar</div>
+        <button onClick={fromPornhub} disabled={busy} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+          className="w-full mb-3 py-2 rounded-lg text-sm font-semibold disabled:opacity-50 flex items-center justify-center gap-2">✨ Fetch from Pornhub</button>
+        <div className="flex flex-col sm:flex-row gap-2 mb-3">
+          <button onClick={() => fileRef.current?.click()} disabled={busy}
+            className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-50">⬆ Upload image…</button>
+          <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => fromFile(e.target.files?.[0])} />
+          <div className="flex gap-2 flex-1">
+            <input value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") fromUrl(); }}
+              placeholder="…or paste an image URL" className="flex-1 bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent" />
+            <button onClick={fromUrl} disabled={busy || !url.trim()} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+              className="text-sm font-semibold px-4 rounded-lg disabled:opacity-50">Set</button>
+          </div>
+        </div>
+        {err && <div className="text-xs text-rose-400 mb-2">{err}</div>}
+        {withThumb.length > 0 && (
+          <>
+            <div className="text-xs text-muted mb-2 mt-1">…or pick a frame from a video</div>
+            <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+              {withThumb.slice(0, 24).map((v) => (
+                <button key={v.site + v.id} onClick={() => fromVideo(v)} disabled={busy}
+                  className="aspect-square rounded-lg overflow-hidden border border-edge hover:border-accent transition disabled:opacity-50">
+                  <img src={mediaURL(v.thumbnail)} loading="lazy" className="w-full h-full object-cover" />
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+        <div className="flex justify-end mt-4">
+          <button onClick={onClose} className="text-sm text-muted hover:text-fg px-3 py-2">Close</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -386,8 +1040,8 @@ function ProfileEditor({ info, onClose, onSaved }: { info: ModelInfo; onClose: (
     onSaved();
   };
   return (
-    <div className="fixed inset-0 bg-black/70 z-50 grid place-items-center" onClick={onClose}>
-      <div className="bg-panel border border-edge rounded-xl p-5 w-[28rem] max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 bg-black/65 backdrop-blur-sm z-50 grid place-items-center p-4" onClick={onClose}>
+      <div className="bg-panel border border-edge rounded-xl p-5 w-[92vw] max-w-[28rem] max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="font-semibold mb-3">Edit {info.name}</div>
         <label className="block text-xs text-muted mb-1">Bio</label>
         <textarea value={bio} onChange={(e) => setBio(e.target.value)} rows={4}
@@ -404,10 +1058,10 @@ function ProfileEditor({ info, onClose, onSaved }: { info: ModelInfo; onClose: (
             </div>
           ))}
         </div>
-        <button onClick={() => setLinks((ls) => [...ls, { label: "", url: "" }])} className="text-xs text-muted hover:text-white mb-4">+ add link</button>
+        <button onClick={() => setLinks((ls) => [...ls, { label: "", url: "" }])} className="text-xs text-muted hover:text-fg mb-4">+ add link</button>
         <div className="flex justify-end gap-2">
-          <button onClick={onClose} className="text-sm text-muted hover:text-white px-3 py-2">Cancel</button>
-          <button onClick={save} style={{ background: "var(--ac)", color: "#0a0a0a" }} className="text-sm font-semibold px-4 py-2 rounded-lg">Save</button>
+          <button onClick={onClose} className="text-sm text-muted hover:text-fg px-3 py-2">Cancel</button>
+          <button onClick={save} style={{ background: "var(--ac)", color: "var(--ac-ink)" }} className="text-sm font-semibold px-4 py-2 rounded-lg">Save</button>
         </div>
       </div>
     </div>
@@ -434,7 +1088,7 @@ function Lightbox({ photos, index, onIndex, onClose, onSetCover }:
       <button onClick={onClose} className="absolute top-4 right-4 text-white/70 hover:text-white text-sm">✕ Close</button>
       {onSetCover && (
         <button onClick={(e) => { e.stopPropagation(); onSetCover(photos[index]); }}
-          className="absolute top-4 left-4 text-xs font-semibold px-3 py-1.5 rounded-lg" style={{ background: "var(--ac)", color: "#0a0a0a" }}>
+          className="absolute top-4 left-4 text-xs font-semibold px-3 py-1.5 rounded-lg" style={{ background: "var(--ac)", color: "var(--ac-ink)" }}>
           Set as cover
         </button>
       )}
@@ -445,39 +1099,62 @@ function Lightbox({ photos, index, onIndex, onClose, onSetCover }:
 
 /* ---------------- Video area (grid + bulk select) ---------------- */
 
-function VideoArea({ videos, modelNames, onPlay, onChanged }:
-  { videos: Video[]; modelNames: string[]; onPlay: (v: Video) => void; onChanged: () => void }) {
+function VideoArea({ videos, modelNames, collections, collectionId, onPlay, onChanged }:
+  { videos: Video[]; modelNames: string[]; collections?: Collection[]; collectionId?: number;
+    onPlay: (v: Video, list?: Video[]) => void; onChanged: () => void }) {
   const [selectMode, setSelectMode] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [moving, setMoving] = useState(false);
+  const [addingColl, setAddingColl] = useState(false);
   const key = (v: Video) => v.site + "/" + v.id;
 
   const toggle = (v: Video) => setPicked((p) => { const n = new Set(p); const k = key(v); n.has(k) ? n.delete(k) : n.add(k); return n; });
   const exit = () => { setSelectMode(false); setPicked(new Set()); };
   const pickedVideos = videos.filter((v) => picked.has(key(v)));
+  const removeFromColl = async () => {
+    if (collectionId == null) return;
+    await Promise.all(pickedVideos.map((v) => RemoveFromCollection(collectionId, v.site, v.id)));
+    exit(); onChanged();
+  };
 
-  if (!videos?.length) return <Empty>No videos here.</Empty>;
+  if (!videos?.length) return <Empty icon="🍧">Nothing in here yet.</Empty>;
   return (
     <>
       <div className="flex items-center gap-3 mb-3 text-sm">
         {!selectMode
-          ? <button onClick={() => setSelectMode(true)} className="text-muted hover:text-white">Select</button>
+          ? <>
+              <button onClick={() => onPlay(videos[0], videos)} className="glow-btn px-4 py-1.5 text-xs flex items-center gap-1.5">▶ Play all</button>
+              <button onClick={() => { const v = videos[Math.floor(Math.random() * videos.length)]; onPlay(v, videos); }} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge flex items-center gap-1.5">⤮ Shuffle</button>
+              <button onClick={() => setSelectMode(true)} className="ml-auto text-muted hover:text-fg">Select</button>
+            </>
           : <>
               <span className="text-muted">{picked.size} selected</span>
-              <button onClick={() => setMoving(true)} disabled={!picked.size} style={{ background: "var(--ac)", color: "#0a0a0a" }}
-                className="font-semibold px-3 py-1.5 rounded-lg text-xs disabled:opacity-40">Move to model…</button>
-              <button onClick={exit} className="text-muted hover:text-white text-xs">Cancel</button>
+              <button onClick={() => setMoving(true)} disabled={!picked.size} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+                className="font-semibold px-3 py-1.5 rounded-lg text-xs disabled:opacity-40">Move to person…</button>
+              {collections && (
+                <button onClick={() => setAddingColl(true)} disabled={!picked.size}
+                  className="font-medium px-3 py-1.5 rounded-lg text-xs bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-40">Add to collection…</button>
+              )}
+              {collectionId != null && (
+                <button onClick={removeFromColl} disabled={!picked.size}
+                  className="font-medium px-3 py-1.5 rounded-lg text-xs bg-edge text-muted hover:text-rose-400 disabled:opacity-40">Remove from collection</button>
+              )}
+              <button onClick={exit} className="text-muted hover:text-fg text-xs">Cancel</button>
             </>}
       </div>
-      <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(230px,1fr))" }}>
+      <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,290px),1fr))" }}>
         {videos.map((v) => (
           <VideoCard key={key(v)} v={v} selectMode={selectMode} selected={picked.has(key(v))}
-            onClick={() => (selectMode ? toggle(v) : onPlay(v))} />
+            onClick={() => (selectMode ? toggle(v) : onPlay(v, videos))} />
         ))}
       </div>
       {moving && (
         <ModelsEditor refs={pickedVideos.map((v) => ({ site: v.site, id: v.id }))} modelNames={modelNames}
           onClose={() => setMoving(false)} onDone={() => { setMoving(false); exit(); onChanged(); }} />
+      )}
+      {addingColl && collections && (
+        <AddToCollectionModal refs={pickedVideos.map((v) => ({ site: v.site, id: v.id }))} collections={collections}
+          onClose={() => setAddingColl(false)} onChanged={() => { exit(); onChanged(); }} />
       )}
     </>
   );
@@ -488,22 +1165,24 @@ function VideoCard({ v, onClick, selectMode, selected }:
   return (
     <div onClick={onClick} className="tile group"
       style={selected ? { boxShadow: "0 0 0 2px var(--ac), 0 14px 44px rgba(0,0,0,.65)" } : undefined}>
-      <div className="aspect-[4/5]">
-        {v.thumbnail
-          ? <img src={mediaURL(v.thumbnail)} loading="lazy" decoding="async" className="w-full h-full object-cover" />
-          : <div className="w-full h-full grid place-items-center text-muted text-4xl bg-panel2">▶</div>}
-      </div>
+      <PreviewMedia v={v} ratio="aspect-video" />
       <div className="overlay" />
-      <div className="absolute top-2 left-2"><SourceBadge site={v.site} /></div>
+      <div className="absolute top-2 left-2 flex items-center gap-1.5">
+        <span className="bg-black/50 text-white backdrop-blur-sm rounded-lg px-1.5 py-0.5 shadow-sm"><SourceBadge site={v.site} /></span>
+        {isNew(v.added) && <span className="swirl-chip text-[10px] font-extrabold px-2 py-0.5 rounded-full">NEW</span>}
+      </div>
       {selectMode && (
         <span className={`absolute top-2 right-2 w-6 h-6 grid place-items-center rounded-full text-sm font-bold ${selected ? "" : "border-2 border-white/70 bg-black/30"}`}
-          style={selected ? { background: "var(--ac)", color: "#0a0a0a" } : undefined}>{selected ? "✓" : ""}</span>
+          style={selected ? { background: "var(--ac)", color: "var(--ac-ink)" } : undefined}>{selected ? "✓" : ""}</span>
       )}
       {!selectMode && v.duration ? <span className="absolute top-2 right-2 bg-black/75 text-white text-[11px] px-1.5 py-0.5 rounded">{fmtDur(v.duration)}</span> : null}
       <div className="absolute bottom-0 left-0 right-0 p-3">
-        <div className="text-sm font-semibold line-clamp-2 leading-snug drop-shadow">{v.favorite ? <span className="text-rose-400">❤ </span> : null}{v.title || v.uploader}</div>
-        <div className="text-xs text-white/60 mt-1 truncate">{(v.models && v.models.length ? v.models.join(", ") : UNASSIGNED)}{v.height ? ` · ${v.height}p` : ""}{v.filesize ? ` · ${fmtSize(v.filesize)}` : ""}</div>
+        <div className="text-sm font-semibold line-clamp-1 leading-snug text-white cap">{v.favorite ? <span className="text-rose-300">❤ </span> : null}{v.title || v.uploader}</div>
+        <div className="text-xs text-white/85 mt-1 truncate cap">{(v.models && v.models.length ? v.models.join(", ") : UNASSIGNED)}{v.height ? ` · ${v.height}p` : ""}{v.filesize ? ` · ${fmtSize(v.filesize)}` : ""}</div>
       </div>
+      {v.position && v.duration && v.position < v.duration * 0.95
+        ? <div className="progress"><i style={{ width: `${Math.round((v.position / v.duration) * 100)}%` }} /></div>
+        : null}
     </div>
   );
 }
@@ -526,13 +1205,13 @@ function ModelsEditor({ refs, modelNames, initial, onClose, onDone }:
   };
 
   return (
-    <div className="fixed inset-0 bg-black/70 z-50 grid place-items-center" onClick={onClose}>
-      <div className="bg-panel border border-edge rounded-xl p-5 w-[26rem]" onClick={(e) => e.stopPropagation()}>
-        <div className="font-semibold mb-1">{bulk ? `Set models for ${refs.length} videos` : "Models"}</div>
-        <p className="text-xs text-muted mb-3">Add one or more models. Type a new name to create it. No models = Unassigned.</p>
+    <div className="fixed inset-0 bg-black/65 backdrop-blur-sm z-50 grid place-items-center p-4" onClick={onClose}>
+      <div className="bg-panel border border-edge rounded-xl p-5 w-[92vw] max-w-[26rem] pop" onClick={(e) => e.stopPropagation()}>
+        <div className="font-semibold mb-1">{bulk ? `Set people for ${refs.length} videos` : "People"}</div>
+        <p className="text-xs text-muted mb-3">Add one or more people. Type a new name to create it. No one = Unsorted.</p>
 
         <div className="flex flex-wrap gap-2 mb-3 min-h-[2rem]">
-          {models.length === 0 && <span className="text-xs text-muted py-1">No models yet</span>}
+          {models.length === 0 && <span className="text-xs text-muted py-1">No one yet</span>}
           {models.map((m) => (
             <span key={m} className="flex items-center gap-1 bg-panel2 border border-edge rounded-full px-3 py-1 text-sm">
               {m} <button onClick={() => setModels(models.filter((x) => x !== m))} className="text-muted hover:text-rose-400">×</button>
@@ -542,15 +1221,15 @@ function ModelsEditor({ refs, modelNames, initial, onClose, onDone }:
 
         <div className="flex gap-2">
           <input list="me-models" value={input} autoFocus onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") add(); }} placeholder="Add a model…"
+            onKeyDown={(e) => { if (e.key === "Enter") add(); }} placeholder="Add a person…"
             className="flex-1 bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent" />
-          <button onClick={add} className="text-sm font-medium px-3 py-2 rounded-lg bg-edge hover:bg-panel2">Add</button>
+          <button onClick={add} className="text-sm font-medium px-3 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">Add</button>
           <datalist id="me-models">{modelNames.map((n) => <option key={n} value={n} />)}</datalist>
         </div>
 
         <div className="flex justify-end gap-2 mt-4">
-          <button onClick={onClose} className="text-sm text-muted hover:text-white px-3 py-2">Cancel</button>
-          <button onClick={save} disabled={busy} style={{ background: "var(--ac)", color: "#0a0a0a" }}
+          <button onClick={onClose} className="text-sm text-muted hover:text-fg px-3 py-2">Cancel</button>
+          <button onClick={save} disabled={busy} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
             className="text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50">Save</button>
         </div>
       </div>
@@ -560,8 +1239,8 @@ function ModelsEditor({ refs, modelNames, initial, onClose, onDone }:
 
 /* ---------------- Watch page (YouTube-style) ---------------- */
 
-function WatchPage({ video, allLabels, modelNames, onClose, onPlay, onOpenModel, onChanged }:
-  { video: Video; allLabels: string[]; modelNames: string[]; onClose: () => void; onPlay: (v: Video) => void; onOpenModel: (name: string) => void; onChanged: () => void }) {
+function WatchPage({ video, queue, allLabels, modelNames, collections, onClose, onPlay, onOpenModel, onChanged }:
+  { video: Video; queue: Video[]; allLabels: string[]; modelNames: string[]; collections: Collection[]; onClose: () => void; onPlay: (v: Video, list?: Video[]) => void; onOpenModel: (name: string) => void; onChanged: () => void }) {
   const [related, setRelated] = useState<Video[]>([]);
   const [editing, setEditing] = useState(false);
   const [tv, setTv] = useState(video.title || "");
@@ -570,9 +1249,44 @@ function WatchPage({ video, allLabels, modelNames, onClose, onPlay, onOpenModel,
   const [models, setModelsState] = useState<string[]>(video.models || []);
   const [newLabel, setNewLabel] = useState("");
   const [moving, setMoving] = useState(false);
+  const [addingColl, setAddingColl] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [vidErr, setVidErr] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
   const primary = models[0] || "";
+
+  // Lean-back playback: resume point, autoplay-next, and the up-next queue.
+  const vidRef = useRef<HTMLVideoElement>(null);
+  const lastSave = useRef(0);
+  const [autoplay, setAutoplay] = useState(() => localStorage.getItem("autoplayNext") !== "0");
+  const idx = queue.findIndex((x) => x.site === video.site && x.id === video.id);
+  const next = idx >= 0 && idx + 1 < queue.length ? queue[idx + 1] : null;
+
+  const savePos = (force = false) => {
+    const el = vidRef.current;
+    if (!el || !el.duration) return;
+    const pos = el.currentTime;
+    if (force || Math.abs(pos - lastSave.current) >= 5) {
+      lastSave.current = pos;
+      SetPosition(video.site, video.id, pos, el.duration);
+    }
+  };
+  const onLoaded = () => {
+    const el = vidRef.current;
+    const p = video.position || 0;
+    if (el && p > 15 && el.duration && p < el.duration - 10) el.currentTime = p;
+  };
+  const onEnded = () => {
+    const dur = vidRef.current?.duration || 0;
+    SetPosition(video.site, video.id, dur, dur); // >=95% clears the resume point
+    if (autoplay && next) onPlay(next, queue);
+  };
+  // Persist progress periodically and on leave, so Continue Watching is accurate.
+  useEffect(() => {
+    const iv = window.setInterval(() => savePos(), 5000);
+    return () => { window.clearInterval(iv); savePos(true); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [video.site, video.id]);
 
   const loadRelated = (m: string) =>
     VideosByModel(m).then((v) => setRelated((v || []).filter((x) => !(x.site === video.site && x.id === video.id))));
@@ -595,14 +1309,46 @@ function WatchPage({ video, allLabels, modelNames, onClose, onPlay, onOpenModel,
   const copy = () => { try { navigator.clipboard?.writeText(video.webpage_url); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {} };
 
   return (
-    <div ref={topRef} className="fixed inset-0 z-40 bg-ink overflow-y-auto">
-      <div className="sticky top-0 z-10 bg-ink/95 backdrop-blur border-b border-edge px-5 py-3">
-        <button onClick={onClose} className="text-muted hover:text-white text-sm">← Back</button>
-      </div>
-      <div className="max-w-5xl mx-auto p-6">
-        <div className="bg-black rounded-xl overflow-hidden" style={{ height: "70vh" }}>
-          <video src={videoURL(video.filepath)} controls autoPlay className="w-full h-full object-contain" />
+    <div ref={topRef} className="fixed inset-0 z-30 md:left-56 bg-ink overflow-y-auto rise">
+      <div className="sticky top-0 z-10 glass border-b border-edge/70" style={{ paddingTop: "env(safe-area-inset-top)" }}>
+        <div className="px-4 md:px-5 py-2.5">
+          <button onClick={onClose} className="text-muted hover:text-fg text-sm font-semibold px-2 py-1.5 -ml-2 rounded-full active:bg-panel2">← Back</button>
         </div>
+      </div>
+      <div className="max-w-5xl mx-auto p-4 md:p-6 pb-28 md:pb-6">
+        <div className="relative bg-black -mx-4 -mt-4 md:mx-0 md:mt-0 md:rounded-blob overflow-hidden shadow-lg shadow-black/40">
+          <video ref={vidRef} src={videoURL(video.filepath)} controls autoPlay playsInline preload="metadata"
+            poster={video.thumbnail ? mediaURL(video.thumbnail) : undefined}
+            onLoadedMetadata={onLoaded} onTimeUpdate={() => savePos()} onPause={() => savePos(true)} onEnded={onEnded}
+            onError={() => setVidErr(true)}
+            className="w-full max-h-[68vh] min-h-[220px] object-contain bg-black" />
+          {vidErr && (
+            <div className="absolute inset-0 grid place-items-center bg-black/85 text-center p-6 pointer-events-none">
+              <div>
+                <div className="text-3xl mb-2">🫠</div>
+                <div className="text-white font-semibold mb-1">This video couldn't be played here</div>
+                <p className="text-white/60 text-xs max-w-xs mx-auto">
+                  The device may not support this file. Try "Fix videos for mobile" in Settings, or play it on the desktop app.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {queue.length > 1 && (
+          <div className="flex items-center gap-3 mt-3 text-sm">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input type="checkbox" checked={autoplay} className="w-4 h-4 accent-[color:var(--ac)]"
+                onChange={(e) => { setAutoplay(e.target.checked); localStorage.setItem("autoplayNext", e.target.checked ? "1" : "0"); }} />
+              <span className="text-muted">Autoplay next</span>
+            </label>
+            {next && (
+              <button onClick={() => onPlay(next, queue)} className="ml-auto text-fg hover:text-accent font-medium truncate max-w-[60%]">
+                Next: <span className="text-muted">{next.title || next.uploader}</span> ▶
+              </button>
+            )}
+          </div>
+        )}
 
         {editing
           ? <input value={tv} autoFocus onChange={(e) => setTv(e.target.value)} onBlur={saveTitle}
@@ -616,39 +1362,49 @@ function WatchPage({ video, allLabels, modelNames, onClose, onPlay, onOpenModel,
             {models.length === 0
               ? <span className="text-muted">{UNASSIGNED}</span>
               : models.map((m) => (
-                  <button key={m} onClick={() => onOpenModel(m)} className="font-medium text-white/90 hover:text-white">{m}</button>
+                  <button key={m} onClick={() => onOpenModel(m)} className="font-medium text-fg/90 hover:text-fg">{m}</button>
                 ))}
-            <button onClick={() => setMoving(true)} title="Edit models" className="text-muted hover:text-white">✎</button>
+            <button onClick={() => setMoving(true)} title="Edit models" className="text-muted hover:text-fg">✎</button>
           </div>
           <span className="text-muted">{[label(video.site), video.height ? `${video.height}p` : "", fmtSize(video.filesize), video.upload_date].filter(Boolean).join("  ·  ")}</span>
-          <div className="ml-auto flex items-center gap-3">
-            <button onClick={toggleFav} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full font-medium ${fav ? "bg-rose-600 text-white" : "bg-edge text-muted hover:text-white"}`}>
+          <div className="md:ml-auto w-full md:w-auto flex items-center flex-wrap gap-2">
+            <button onClick={toggleFav} className={`flex items-center gap-1.5 px-3.5 py-2 rounded-full text-sm font-semibold transition ${fav ? "bg-rose-500 text-white" : "bg-panel2 text-fg hover:bg-edge border border-edge"}`}>
               {fav ? "❤ Liked" : "♡ Like"}
             </button>
-            {video.webpage_url && <button onClick={copy} className="text-muted hover:text-white">{copied ? "Copied!" : "Copy link"}</button>}
-            {video.webpage_url && <button onClick={() => BrowserOpenURL(video.webpage_url)} className="text-muted hover:text-white">Source ↗</button>}
-            <button onClick={() => OpenFolder(video.filepath)} className="text-muted hover:text-white">Show file</button>
+            <button onClick={() => setAddingColl(true)} className="px-3.5 py-2 rounded-full text-sm font-medium bg-panel2 text-fg hover:bg-edge border border-edge">+ Collection</button>
+            {video.webpage_url && <button onClick={copy} className="px-3.5 py-2 rounded-full text-sm font-medium bg-panel2 text-fg hover:bg-edge border border-edge">{copied ? "Copied ✓" : "Copy link"}</button>}
+            {video.webpage_url && <button onClick={() => BrowserOpenURL(video.webpage_url)} className="px-3.5 py-2 rounded-full text-sm font-medium bg-panel2 text-fg hover:bg-edge border border-edge">Source ↗</button>}
+            {isDesktopApp && <button onClick={() => OpenFolder(video.filepath)} className="px-3.5 py-2 rounded-full text-sm font-medium bg-panel2 text-fg hover:bg-edge border border-edge">Show file</button>}
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2 mt-4">
-          <span className="text-muted text-sm">🏷️</span>
+          <Icon name="tag" className="w-4 h-4 text-muted" />
           {labels.map((l) => (
             <span key={l} className="flex items-center gap-1 bg-panel2 border border-edge rounded-full px-3 py-1 text-xs">
               {l} <button onClick={() => commitLabels(labels.filter((x) => x !== l))} className="text-muted hover:text-rose-400">×</button>
             </span>
           ))}
           <input list="all-labels" value={newLabel} onChange={(e) => setNewLabel(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") addLabel(); }} placeholder="+ add category"
+            onKeyDown={(e) => { if (e.key === "Enter") addLabel(); }} placeholder="+ add tag"
             className="bg-panel border border-edge rounded-full px-3 py-1 text-xs w-36 outline-none focus:border-accent" />
           <datalist id="all-labels">{allLabels.map((l) => <option key={l} value={l} />)}</datalist>
         </div>
 
+        {next && (
+          <div className="mt-8">
+            <h2 className="font-semibold mb-3">Up next</h2>
+            <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,260px),1fr))" }}>
+              {queue.slice(idx + 1, idx + 13).map((v) => <VideoCard key={v.site + "/" + v.id} v={v} onClick={() => onPlay(v, queue)} />)}
+            </div>
+          </div>
+        )}
+
         {related.length > 0 && (
           <div className="mt-8">
             <h2 className="font-semibold mb-3">More from {primary || "this collection"}</h2>
-            <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(200px,1fr))" }}>
-              {related.map((v) => <VideoCard key={v.site + "/" + v.id} v={v} onClick={() => onPlay(v)} />)}
+            <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,260px),1fr))" }}>
+              {related.map((v) => <VideoCard key={v.site + "/" + v.id} v={v} onClick={() => onPlay(v, related)} />)}
             </div>
           </div>
         )}
@@ -658,6 +1414,10 @@ function WatchPage({ video, allLabels, modelNames, onClose, onPlay, onOpenModel,
           onClose={() => setMoving(false)}
           onDone={(m) => { setMoving(false); setModelsState(m); video.models = m; loadRelated(m[0] || ""); onChanged(); }} />
       )}
+      {addingColl && (
+        <AddToCollectionModal refs={[{ site: video.site, id: video.id }]} collections={collections}
+          onClose={() => setAddingColl(false)} onChanged={onChanged} />
+      )}
     </div>
   );
 }
@@ -666,74 +1426,147 @@ function WatchPage({ video, allLabels, modelNames, onClose, onPlay, onOpenModel,
 
 function BrowseSync({ onEnqueued }: { onEnqueued: () => void }) {
   const [url, setUrl] = useState("");
+  const [loadedURL, setLoadedURL] = useState("");
   const [items, setItems] = useState<downloader.RemoteItem[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState({ x: false, pornhub: false });
   const [fav, setFav] = useState(localStorage.phUser || "");
+  const [lists, setLists] = useState<SyncSummary[]>([]);
+  const [adding, setAdding] = useState(false);
 
-  useEffect(() => { CookieStatus().then(setStatus); }, []);
+  const loadLists = () => SyncedLists().then((l) => setLists(l || []));
+  useEffect(() => { CookieStatus().then(setStatus); loadLists(); }, []);
 
-  const loadURL = async (u: string) => {
+  // refresh=false uses the cached list (instant); refresh=true re-fetches from the site.
+  const loadURL = async (u: string, refresh = false) => {
     u = u.trim(); if (!u) return;
-    setLoading(true); setItems(null); setPicked(new Set());
-    try { setItems((await Enumerate(u)) || []); } catch { setItems([]); } finally { setLoading(false); }
+    setLoadedURL(u); setLoading(true); setItems(null); setPicked(new Set());
+    try { setItems((await Enumerate(u, refresh)) || []); } catch { setItems([]); } finally { setLoading(false); }
+    loadLists();
   };
   const loadFavorites = () => {
     const user = fav.trim(); if (!user) return;
     localStorage.phUser = user;
     loadURL(`https://www.pornhub.com/users/${user}/videos/favorites`);
   };
+  const remove = async (u: string) => { await RemoveSync(u); loadLists(); };
+  const back = () => { setItems(null); setLoadedURL(""); loadLists(); };
   const toggle = (u: string) => setPicked((p) => { const n = new Set(p); n.has(u) ? n.delete(u) : n.add(u); return n; });
   const newItems = (items || []).filter((i) => !i.owned);
   const ownedCount = (items || []).length - newItems.length;
-  const download = () => { picked.forEach((u) => Enqueue(u)); onEnqueued(); };
+  const download = async () => { await EnqueueMany([...picked]); setPicked(new Set()); onEnqueued(); };
+  const openTitle = lists.find((l) => l.url === loadedURL)?.title || syncLabelOf(loadedURL);
+
+  const showList = items !== null || loading;
 
   return (
-    <div className="p-6 max-w-3xl">
-      <h1 className="text-xl font-semibold mb-1">Sync</h1>
-      <p className="text-sm text-muted mb-4">Pull in a Pornhub model, channel, or playlist — pick what you want and it downloads into your library.</p>
-
-      <div className="flex gap-2">
-        <input value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") loadURL(url); }}
-          placeholder="https://www.pornhub.com/model/NAME/videos"
-          className="flex-1 bg-panel border border-edge rounded-lg px-4 py-3 text-sm outline-none focus:border-accent" />
-        <button onClick={() => loadURL(url)} disabled={loading} style={{ background: "var(--ac)", color: "#0a0a0a" }}
-          className="font-semibold px-6 rounded-lg disabled:opacity-50">{loading ? "Loading…" : "Load"}</button>
+    <div className="p-4 md:p-6 max-w-4xl">
+      <div className="flex items-center gap-3 mb-1">
+        <h1 className="text-xl font-bold">Following</h1>
+        {!showList && <button onClick={() => setAdding((a) => !a)} className="ml-auto text-sm font-semibold px-4 py-1.5 glow-btn">{adding ? "Close" : "+ Follow"}</button>}
       </div>
+      <p className="text-sm text-muted mb-4">People, channels, and lists you keep an eye on — open one to see what's new since last time.</p>
 
-      <div className="flex items-center gap-2 mt-3 text-sm">
-        <span className="text-muted">★ Your favorites:</span>
-        <input value={fav} onChange={(e) => setFav(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") loadFavorites(); }}
-          placeholder="pornhub username" className="w-48 bg-panel border border-edge rounded-lg px-3 py-2 outline-none focus:border-accent" />
-        <button onClick={loadFavorites} disabled={!status.pornhub || !fav.trim()}
-          className="text-xs font-semibold px-3 py-2 rounded-lg bg-edge hover:bg-panel2 disabled:opacity-40">Sync my favorites</button>
-        {!status.pornhub && <span className="text-xs text-amber-400">Connect Pornhub in Downloads first</span>}
-      </div>
+      {/* Add-a-sync panel */}
+      {!showList && adding && (
+        <div className="bg-panel border border-edge rounded-xl p-4 mb-6 pop">
+          <div className="text-sm font-semibold mb-2">Paste a Pornhub link</div>
+          <div className="flex gap-2">
+            <input value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") loadURL(url); }} autoFocus
+              placeholder="https://www.pornhub.com/model/NAME/videos"
+              className="flex-1 bg-panel2 border border-edge rounded-lg px-4 py-2.5 text-sm outline-none focus:border-accent" />
+            <button onClick={() => loadURL(url)} disabled={loading} className="glow-btn px-6 rounded-lg disabled:opacity-50">Load</button>
+          </div>
+          <div className="flex items-center flex-wrap gap-2 mt-3 text-sm">
+            <span className="text-muted">❤ Favorites:</span>
+            <input value={fav} onChange={(e) => setFav(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") loadFavorites(); }}
+              placeholder="your pornhub username" className="w-48 bg-panel2 border border-edge rounded-lg px-3 py-2 outline-none focus:border-accent" />
+            <button onClick={loadFavorites} disabled={!status.pornhub || !fav.trim()}
+              className="text-xs font-semibold px-3 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-40">Sync favorites</button>
+            {!status.pornhub && <span className="text-xs text-amber-400">Connect Pornhub in Settings first</span>}
+          </div>
+        </div>
+      )}
 
-      {loading && <Empty>Loading list…</Empty>}
-      {items && items.length > 0 && (
+      {/* Saved syncs */}
+      {!showList && (
+        lists.length === 0
+          ? <Empty icon="✨" action={{ label: "+ Follow someone", onClick: () => setAdding(true) }}>You're not following anything yet. Add a person, channel, or your favorites and Keepsake will keep track of what's new.</Empty>
+          : (
+            <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(240px,1fr))" }}>
+              {lists.map((l) => (
+                <SyncCard key={l.url} l={l} onOpen={() => loadURL(l.url)} onRefresh={() => loadURL(l.url, true)} onRemove={() => remove(l.url)} />
+              ))}
+            </div>
+          )
+      )}
+
+      {/* Open a list */}
+      {showList && (
         <>
-          <div className="flex items-center gap-3 mt-6 mb-3 text-sm">
-            <span className="font-semibold">{items.length} videos</span>
-            <span className="text-muted">· {ownedCount} owned · {newItems.length} new · {picked.size} selected</span>
-            <button onClick={() => setPicked(new Set(newItems.map((i) => i.url)))} className="ml-auto text-xs text-muted hover:text-white">Select all new</button>
-            <button onClick={download} disabled={!picked.size} style={{ background: "var(--ac)", color: "#0a0a0a" }}
-              className="text-xs font-semibold px-4 py-2 rounded-lg disabled:opacity-40">Download {picked.size || ""}</button>
+          <div className="flex items-center gap-3 mb-4">
+            <button onClick={back} className="text-muted hover:text-fg text-sm">← Following</button>
+            <h2 className="text-lg font-bold truncate">{openTitle}</h2>
           </div>
-          <div className="space-y-1">
-            {items.map((it) => (
-              <label key={it.url} className={`flex items-center gap-3 px-3 py-2 rounded-lg ${it.owned ? "opacity-50" : "hover:bg-panel2 cursor-pointer"}`}>
-                {it.owned
-                  ? <span className="text-xs text-emerald-400 w-16 shrink-0">in library</span>
-                  : <input type="checkbox" checked={picked.has(it.url)} onChange={() => toggle(it.url)} className="w-4 h-4 accent-pink-500 shrink-0" />}
-                <span className="text-sm truncate">{it.title || it.url}</span>
-              </label>
-            ))}
-          </div>
+          {loading && <CardGridSkeleton count={8} ratio="h-12" />}
+          {items && items.length > 0 && (
+            <>
+              <div className="flex items-center flex-wrap gap-3 mb-3 text-sm sticky top-0 bg-ink/95 backdrop-blur py-2 z-10">
+                <span className="font-semibold">{items.length} videos</span>
+                <span className="text-muted">· {ownedCount} owned · {newItems.length} new · {picked.size} selected</span>
+                <button onClick={() => loadURL(loadedURL, true)} disabled={loading} className="text-xs text-muted hover:text-fg">↻ Refresh</button>
+                <button onClick={() => setPicked(new Set(newItems.map((i) => i.url)))} className="ml-auto text-xs text-muted hover:text-fg">Select all new</button>
+                <button onClick={download} disabled={!picked.size} className="glow-btn text-xs px-4 py-2 rounded-lg disabled:opacity-40">Download {picked.size || ""}</button>
+              </div>
+              <div className="space-y-1">
+                {items.map((it) => (
+                  <label key={it.url} className={`flex items-center gap-3 px-3 py-2 rounded-lg ${it.owned ? "opacity-50" : "hover:bg-panel2 cursor-pointer"}`}>
+                    {it.owned
+                      ? <span className="text-xs text-emerald-400 w-16 shrink-0">in library</span>
+                      : <input type="checkbox" checked={picked.has(it.url)} onChange={() => toggle(it.url)} className="w-4 h-4 accent-[color:var(--ac)] shrink-0" />}
+                    <span className="text-sm truncate">{it.title || it.url}</span>
+                  </label>
+                ))}
+              </div>
+            </>
+          )}
+          {items && items.length === 0 && !loading && <Empty>No videos found — check the URL, or connect Pornhub for private lists.</Empty>}
         </>
       )}
-      {items && items.length === 0 && !loading && <Empty>No videos found — check the URL, or connect Pornhub for private lists.</Empty>}
+    </div>
+  );
+}
+
+// syncLabelOf derives a readable name from a sync URL on the client (fallback
+// when the saved summary isn't loaded yet).
+function syncLabelOf(u: string) {
+  const m = u.match(/\/(?:model|pornstar|channels?|users)\/([^/?#]+)/i);
+  const base = m ? decodeURIComponent(m[1]).replace(/[-_]/g, " ") : u.replace(/^https?:\/\/(www\.)?/, "");
+  return /favorit/i.test(u) ? base + " — favorites" : base;
+}
+
+function SyncCard({ l, onOpen, onRefresh, onRemove }:
+  { l: SyncSummary; onOpen: () => void; onRefresh: () => void; onRemove: () => void }) {
+  return (
+    <div onClick={onOpen} className="group relative bg-panel border border-edge rounded-xl p-4 hover:border-accent transition cursor-pointer">
+      <button onClick={(e) => { e.stopPropagation(); onRemove(); }} title="Unfollow"
+        className="absolute top-2.5 right-2.5 opacity-0 group-hover:opacity-100 text-muted hover:text-rose-400 text-lg leading-none">×</button>
+      <div className="flex items-center gap-3">
+        <div className="w-11 h-11 rounded-xl bg-panel2 grid place-items-center text-xl shrink-0">{kindIcon(l.kind)}</div>
+        <div className="min-w-0 flex-1 pr-4">
+          <div className="font-semibold truncate">{l.title || l.url}</div>
+          <div className="text-[11px] text-muted capitalize">{l.kind} · fetched {fmtAgo(l.fetchedAt)}</div>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 mt-3 text-xs">
+        <span className="text-fg font-medium">{l.count} videos</span>
+        {l.new > 0
+          ? <span className="px-1.5 py-0.5 rounded-full font-semibold" style={{ background: "rgb(var(--ac-rgb) / .14)", color: "var(--ac)" }}>{l.new} new</span>
+          : <span className="text-muted">all downloaded</span>}
+        <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} title="Re-fetch from site"
+          className="ml-auto text-muted hover:text-fg px-2 py-1 rounded-lg hover:bg-panel2">↻ Refresh</button>
+      </div>
     </div>
   );
 }
@@ -744,35 +1577,118 @@ function SettingsPage() {
   const [root, setRoot] = useState("");
   const [changed, setChanged] = useState(false);
   const [stats, setStats] = useState<library.Stats | null>(null);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [rebuilt, setRebuilt] = useState<number | null>(null);
+  const [avBusy, setAvBusy] = useState(false);
+  const [avProg, setAvProg] = useState<{ done: number; total: number; added: number; name?: string; finished?: boolean } | null>(null);
+  const [accent, setAccent] = useState(localStorage.accent || "236 92 133");
+  const [conn, setConn] = useState({ x: false, pornhub: false });
+  const [autoNext, setAutoNext] = useState(localStorage.autoplayNext !== "0");
+  const [hoverPrev, setHoverPrev] = useState(localStorage.hoverPreview !== "0");
+  const [backupPath, setBackupPath] = useState("");
+  const [backuping, setBackuping] = useState(false);
+  const [optBusy, setOptBusy] = useState(false);
+  const [optProg, setOptProg] = useState<{ done: number; total: number; fixed: number; failed: number; name?: string; finished?: boolean } | null>(null);
 
-  useEffect(() => { MediaRootPath().then(setRoot); Stats().then(setStats); }, []);
+  useEffect(() => { MediaRootPath().then(setRoot); Stats().then(setStats); CookieStatus().then(setConn); }, []);
+  useEffect(() => {
+    const off = EventsOn("optimize", (s: any) => { setOptProg(s); if (s.finished) setOptBusy(false); });
+    return () => off();
+  }, []);
+  const optimize = () => { setOptBusy(true); setOptProg(null); OptimizeStreaming(); };
+  const pickAccent = (rgb: string) => { setAccent(rgb); localStorage.accent = rgb; applyAccent(rgb); };
+  const connect = async () => setConn(await ConnectCookies());
+  const toggleAuto = (on: boolean) => { setAutoNext(on); localStorage.autoplayNext = on ? "1" : "0"; };
+  const toggleHover = (on: boolean) => { setHoverPrev(on); localStorage.hoverPreview = on ? "1" : "0"; };
+  const doBackup = async () => { setBackuping(true); try { const r = await BackupCatalogue(); setBackupPath(r.path); } finally { setBackuping(false); } };
+  useEffect(() => {
+    const off = EventsOn("avatar", (s: any) => { setAvProg(s); if (s.finished) setAvBusy(false); });
+    return () => off();
+  }, []);
+  const rebuild = async () => {
+    setRebuilding(true); setRebuilt(null);
+    try { const r = await RebuildLibrary(); setRebuilt(r.count); Stats().then(setStats); }
+    finally { setRebuilding(false); }
+  };
+  const fetchAvatars = () => { setAvBusy(true); setAvProg(null); FetchAllAvatars(); };
   const change = async () => { const next = await ChooseMediaRoot(); if (next && next !== root) { setRoot(next); setChanged(true); } };
-  const siteColor = (s: string) => (s === "PornHub" ? "#ff9000" : s === "Twitter" ? "#e7e9ea" : "#ff2d77");
+  const siteColor = (s: string) => (s === "PornHub" ? "#e8964e" : s === "Twitter" ? "#5da4d4" : "var(--ac)");
 
   return (
-    <div className="p-6 max-w-3xl">
+    <div className="p-4 md:p-6 max-w-3xl">
       <h1 className="text-xl font-semibold mb-6">Settings</h1>
+
+      <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
+        <div className="text-sm font-semibold mb-3">Flavor</div>
+        <div className="flex items-center gap-3">
+          {ACCENTS.map((a) => (
+            <button key={a.rgb} onClick={() => pickAccent(a.rgb)} title={a.name}
+              className="w-10 h-10 rounded-full grid place-items-center transition"
+              style={{ background: `rgb(${a.rgb})`, boxShadow: accent === a.rgb ? `0 0 0 3px var(--milk), 0 0 0 5px rgb(${a.rgb})` : "inset 0 1px 0 rgba(255,255,255,.4)" }}>
+              {accent === a.rgb && <span className="text-sm font-bold text-white">✓</span>}
+            </button>
+          ))}
+          <span className="text-xs text-muted ml-1">Pick a flavor — changes the whole app instantly.</span>
+        </div>
+      </section>
+
       <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
         <div className="text-sm font-semibold mb-1">Library location</div>
         <p className="text-xs text-muted mb-3">Where your videos, thumbnails, and catalogue live. Point this at an external drive to take your vault with you.</p>
         <div className="flex items-center gap-2">
-          <code className="flex-1 bg-ink border border-edge rounded-lg px-3 py-2 text-sm truncate">{root || "…"}</code>
-          <button onClick={change} className="text-sm font-medium px-4 py-2 rounded-lg bg-edge hover:bg-panel2 shrink-0">Change folder…</button>
+          <code className="flex-1 bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm truncate">{root || "…"}</code>
+          {isDesktopApp && <button onClick={change} className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge shrink-0">Change folder…</button>}
         </div>
         {changed && (
           <div className="mt-3 flex items-center gap-3 text-sm text-amber-400">
             Saved — restart to use the new location.
-            <button onClick={() => RestartApp()} style={{ background: "var(--ac)", color: "#0a0a0a" }} className="font-semibold px-3 py-1.5 rounded-lg">Restart now</button>
+            <button onClick={() => RestartApp()} style={{ background: "var(--ac)", color: "var(--ac-ink)" }} className="font-semibold px-3 py-1.5 rounded-lg">Restart now</button>
           </div>
         )}
       </section>
+      <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
+        <div className="text-sm font-semibold mb-1">Connections</div>
+        <p className="text-xs text-muted mb-3 leading-relaxed">
+          Connect an account so protected / age-restricted posts and favorites work. Export with
+          <b> “Get cookies.txt LOCALLY”</b> while logged in, then connect it here — saved in your vault.
+        </p>
+        <ConnRow label={<SourceBadge site="PornHub" />} on={conn.pornhub} onConnect={connect} />
+        <ConnRow label={<SourceBadge site="Twitter" />} on={conn.x} onConnect={connect} />
+      </section>
+
+      <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
+        <div className="text-sm font-semibold mb-3">Playback</div>
+        <ToggleRow label="Autoplay next" hint="Play the next video automatically when one ends." on={autoNext} onChange={toggleAuto} />
+        <ToggleRow label="Hover preview" hint="Play a muted clip when you hover a video card (desktop only)." on={hoverPrev} onChange={toggleHover} />
+      </section>
+
+      <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
+        <div className="text-sm font-semibold mb-1">Fix videos for mobile</div>
+        <p className="text-xs text-muted mb-3 leading-relaxed">
+          Some downloads store their index at the end of the file, so phones sit on a spinner
+          before anything plays. This scans the vault and rewrites those files so they start
+          instantly — a lossless copy, no quality change, a few seconds per file.
+        </p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <button onClick={optimize} disabled={optBusy}
+            className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-50">
+            {optBusy ? "Fixing…" : "Scan & fix now"}
+          </button>
+          {optProg && (optProg.finished
+            ? <span className="text-sm text-emerald-400">
+                {optProg.total === 0 ? "All videos already stream instantly ✓" : `Fixed ${optProg.fixed} of ${optProg.total} video${optProg.total === 1 ? "" : "s"} ✓${optProg.failed ? ` (${optProg.failed} skipped)` : ""}`}
+              </span>
+            : <span className="text-sm text-muted">{optProg.done}/{optProg.total} · {optProg.fixed} fixed… <span className="text-muted/60">{optProg.name || ""}</span></span>)}
+        </div>
+      </section>
+
       <section className="bg-panel border border-edge rounded-xl p-5">
         <div className="text-sm font-semibold mb-3">Storage</div>
         {!stats ? <div className="text-muted text-sm">Loading…</div> : (
           <>
             <div className="flex items-baseline gap-2 mb-4">
               <span className="text-3xl font-bold">{fmtSize(stats.totalBytes)}</span>
-              <span className="text-muted text-sm">· {stats.videoCount} videos · {stats.modelCount} models</span>
+              <span className="text-muted text-sm">· {stats.videoCount} videos · {stats.modelCount} people</span>
             </div>
             <div className="space-y-3">
               {(stats.sites || []).map((s) => {
@@ -783,13 +1699,62 @@ function SettingsPage() {
                       <span className="flex items-center gap-2"><SourceBadge site={s.site} /><span className="text-muted">· {s.count} videos</span></span>
                       <span className="font-medium">{fmtSize(s.bytes)} <span className="text-muted text-xs">({pct}%)</span></span>
                     </div>
-                    <div className="h-2 bg-ink rounded-full overflow-hidden"><div className="h-full" style={{ width: pct + "%", background: siteColor(s.site) }} /></div>
+                    <div className="h-2 bg-panel2 rounded-full overflow-hidden"><div className="h-full" style={{ width: pct + "%", background: siteColor(s.site) }} /></div>
                   </div>
                 );
               })}
             </div>
           </>
         )}
+      </section>
+
+      <section className="bg-panel border border-edge rounded-xl p-5 mt-6">
+        <div className="text-sm font-semibold mb-1">Backup &amp; safety</div>
+        <p className="text-xs text-muted mb-3 leading-relaxed">
+          Back up your catalogue (models, favorites, labels, collections, resume points) to a timestamped
+          file in <code>.keepsake/backups</code>. Your media files aren't copied — only the database.
+        </p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <button onClick={doBackup} disabled={backuping}
+            className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-50">
+            {backuping ? "Backing up…" : "Back up catalogue now"}
+          </button>
+          {isDesktopApp && <button onClick={() => root && OpenFolder(root)} className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">Reveal vault folder</button>}
+          {backupPath && <span className="text-sm text-emerald-400 flex items-center gap-2">Saved ✓ {isDesktopApp && <button onClick={() => OpenFolder(backupPath)} className="text-muted hover:text-fg underline">show</button>}</span>}
+        </div>
+      </section>
+
+      <section className="bg-panel border border-edge rounded-xl p-5 mt-6">
+        <div className="text-sm font-semibold mb-1">Maintenance</div>
+        <p className="text-xs text-muted mb-3 leading-relaxed">
+          <b>Rebuild library from disk</b> re-scans your vault and restores catalogue entries from the
+          media and their saved metadata. Use it if the library looks wrong, or after moving files
+          around — your models, favorites, and labels are kept. Nothing is deleted.
+        </p>
+        <div className="flex items-center gap-3">
+          <button onClick={rebuild} disabled={rebuilding}
+            className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-50">
+            {rebuilding ? "Rebuilding…" : "Rebuild library from disk"}
+          </button>
+          {rebuilt !== null && <span className="text-sm text-emerald-400">Catalogued {rebuilt} files ✓</span>}
+        </div>
+      </section>
+
+      <section className="bg-panel border border-edge rounded-xl p-5 mt-6">
+        <div className="text-sm font-semibold mb-1">Avatars</div>
+        <p className="text-xs text-muted mb-3 leading-relaxed">
+          Auto-fetch profile pictures from Pornhub for people that don't have a custom avatar yet.
+          You can always override any of them from a person's page. Connect your Pornhub cookies (in Connections above) for the best hit rate.
+        </p>
+        <div className="flex items-center gap-3">
+          <button onClick={fetchAvatars} disabled={avBusy}
+            className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-50">
+            {avBusy ? "Fetching…" : "Fetch avatars from Pornhub"}
+          </button>
+          {avProg && (avProg.finished
+            ? <span className="text-sm text-emerald-400">Set {avProg.added} avatar{avProg.added === 1 ? "" : "s"} ✓</span>
+            : <span className="text-sm text-muted">{avProg.done}/{avProg.total} · {avProg.added} found… <span className="text-muted/60">{avProg.name || ""}</span></span>)}
+        </div>
       </section>
     </div>
   );
@@ -802,57 +1767,69 @@ function ConnRow({ label, on, onConnect }: any) {
     <div className="flex items-center gap-3 py-1.5">
       <span className="w-28">{label}</span>
       <span className={`text-xs ${on ? "text-emerald-400" : "text-muted"}`}>{on ? "connected ✓" : "not connected"}</span>
-      <button onClick={onConnect} className="ml-auto text-xs font-medium px-3 py-1.5 rounded-lg bg-edge hover:bg-panel2">{on ? "Reconnect" : "Connect"}</button>
+      <button onClick={onConnect} className="ml-auto text-xs font-medium px-3 py-1.5 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">{on ? "Reconnect" : "Connect"}</button>
+    </div>
+  );
+}
+
+function ToggleRow({ label, hint, on, onChange }: { label: string; hint: string; on: boolean; onChange: (on: boolean) => void }) {
+  return (
+    <div className="flex items-center gap-3 py-2">
+      <div className="min-w-0">
+        <div className="text-sm">{label}</div>
+        <div className="text-xs text-muted">{hint}</div>
+      </div>
+      <button onClick={() => onChange(!on)} role="switch" aria-checked={on} aria-label={label}
+        className="ml-auto shrink-0 w-11 h-6 rounded-full relative transition" style={{ background: on ? "var(--ac)" : "#332E3F" }}>
+        <span className="absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all" style={{ left: on ? "22px" : "2px" }} />
+      </button>
     </div>
   );
 }
 
 function Downloads({ queue }: { queue: Job[] }) {
   const [url, setUrl] = useState("");
-  const [status, setStatus] = useState({ x: false, pornhub: false });
-  useEffect(() => { CookieStatus().then(setStatus); }, []);
-  const connect = async () => setStatus(await ConnectCookies());
   const add = () => { const u = url.trim(); if (!u) return; Enqueue(u); setUrl(""); };
 
+  const active = queue.filter((j) => j.status === "downloading").length;
+  const queued = queue.filter((j) => j.status === "queued").length;
+  const finished = queue.filter((j) => ["done", "duplicate", "error"].includes(j.status)).length;
+
   return (
-    <div className="p-6 max-w-3xl">
-      <h1 className="text-xl font-semibold mb-4">Downloads</h1>
-      <div className="flex gap-2">
-        <input value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") add(); }}
-          placeholder="Paste a video URL and press Enter…"
-          className="flex-1 bg-panel border border-edge rounded-lg px-4 py-3 text-sm outline-none focus:border-accent" />
-        <button onClick={add} className="bg-accent hover:bg-sky-500 text-white font-semibold px-6 rounded-lg">Add</button>
+    <div className="p-4 md:p-6 max-w-3xl">
+      <div className="flex items-baseline gap-3 mb-4">
+        <h1 className="text-xl font-semibold">Downloads</h1>
+        {(active || queued) ? <span className="text-sm text-muted">{active} downloading · {queued} queued</span> : null}
       </div>
 
-      <div className="mt-6 bg-panel border border-edge rounded-lg p-4">
-        <div className="text-sm font-semibold mb-1">Connections</div>
-        <p className="text-xs text-muted mb-3 leading-relaxed">
-          Connect an account so protected / age-restricted posts and your favorites work.
-          Install <b>“Get cookies.txt LOCALLY”</b>, open <b>x.com</b> or <b>pornhub.com</b> while logged in,
-          click <b>Export</b>, then connect that file here. Saved in your vault and reused automatically.
-        </p>
-        <ConnRow label={<SourceBadge site="PornHub" />} on={status.pornhub} onConnect={connect} />
-        <ConnRow label={<SourceBadge site="Twitter" />} on={status.x} onConnect={connect} />
-      </div>
+      <section className="bg-panel border border-edge rounded-xl p-5 mb-4">
+        <div className="text-sm font-semibold mb-2">Add a download</div>
+        <div className="flex gap-2">
+          <input value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") add(); }}
+            placeholder="Paste a video URL and press Enter…"
+            className="flex-1 bg-panel2 border border-edge rounded-lg px-4 py-2.5 text-sm outline-none focus:border-accent" />
+          <button onClick={add} className="glow-btn px-6 rounded-lg">Add</button>
+        </div>
+        <p className="text-xs text-muted mt-2">A single video from Pornhub, X/Twitter, and many other sites. For a whole person or your favorites, use <b>Following</b>. Private posts need an account connected in <b>Settings</b>.</p>
+      </section>
 
-      <div className="mt-6 bg-panel border border-edge rounded-lg p-4">
+      <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
         <div className="text-sm font-semibold mb-1">Import from your PC</div>
         <p className="text-xs text-muted mb-3 leading-relaxed">
-          Add videos you already have. A whole <b>folder</b> becomes a model (named after the folder); loose files land in
-          Unassigned. Or just <b>drag &amp; drop</b> files/folders anywhere in the app — dropping onto a model page files them under that model.
+          Add videos you already have. A <b>folder</b> becomes a model; loose files land in Unassigned.
+          You can also <b>drag &amp; drop</b> anywhere — onto a person's page to file them there.
         </p>
         <div className="flex gap-2">
-          <button onClick={() => ImportFilesDialog("")} className="text-sm font-medium px-4 py-2 rounded-lg bg-edge hover:bg-panel2">Import files…</button>
-          <button onClick={() => ImportFolderDialog()} className="text-sm font-medium px-4 py-2 rounded-lg bg-edge hover:bg-panel2">Import folder…</button>
+          <button onClick={() => ImportFilesDialog("")} className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">Import files…</button>
+          <button onClick={() => ImportFolderDialog()} className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">Import folder…</button>
         </div>
-      </div>
+      </section>
 
-      <div className="flex items-center justify-between mt-8 mb-2">
-        <h2 className="font-semibold">Queue</h2>
-        {queue.some((j) => ["done", "duplicate", "error"].includes(j.status)) &&
-          <button onClick={() => ClearFinished()} className="text-xs text-muted hover:text-white">Clear finished</button>}
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="font-semibold">Queue {queue.length > 0 && <span className="text-muted font-normal text-sm">· {queue.length}</span>}</h2>
+        {finished > 0 && <button onClick={() => ClearFinished()} className="text-xs text-muted hover:text-fg">Clear finished ({finished})</button>}
       </div>
-      {queue.length === 0 ? <Empty>Nothing queued.</Empty>
+      {queue.length === 0 ? <Empty icon="🥄">Nothing queued. Paste a URL above, or open Following to pull everything from someone you like.</Empty>
         : <div className="space-y-2">{queue.map((j) => <QueueItem key={j.id} j={j} />)}</div>}
     </div>
   );
@@ -867,7 +1844,7 @@ function QueueItem({ j }: { j: Job }) {
         {j.status === "queued" && <button onClick={() => RemoveJob(j.id)} className="text-muted hover:text-rose-400 px-1">✕</button>}
       </div>
       {(j.status === "downloading" || j.status === "done") && (
-        <div className="h-1.5 bg-ink rounded-full mt-2 overflow-hidden">
+        <div className="h-1.5 bg-panel2 rounded-full mt-2 overflow-hidden">
           <div className="h-full bg-accent transition-all" style={{ width: `${j.status === "done" ? 100 : j.percent || 0}%` }} />
         </div>
       )}
@@ -881,11 +1858,204 @@ function QueueItem({ j }: { j: Job }) {
   );
 }
 
-function Empty({ children }: { children: any }) {
+/* ---------------- Feed (TikTok-style vertical swipe) ---------------- */
+
+function Feed({ onOpenModel, onClose, collections, allLabels, onChanged }:
+  { onOpenModel: (name: string) => void; onClose: () => void; collections: Collection[]; allLabels: string[]; onChanged: () => void }) {
+  const [videos, setVideos] = useState<Video[]>([]);
+  const [current, setCurrent] = useState(0);
+  const [muted, setMuted] = useState(true);
+  useEffect(() => { RecentlyDownloaded().then((v) => setVideos((v || []).slice(0, 60))); }, []);
+  // Stable callbacks so scrolling doesn't re-create every item's observer.
+  const onVisible = useCallback((i: number) => setCurrent(i), []);
+  const onToggleMute = useCallback(() => setMuted((m) => !m), []);
+
+  if (!videos.length) {
+    return (
+      <div className="fixed inset-0 z-50 bg-black grid place-items-center text-white/70 text-sm">
+        <div className="text-center">Nothing to play yet — download or import some videos.</div>
+        <button onClick={onClose} className="absolute top-4 left-4 w-10 h-10 rounded-full bg-white/15 text-white grid place-items-center">✕</button>
+      </div>
+    );
+  }
   return (
-    <div className="flex flex-col items-center justify-center text-muted py-24 gap-3">
-      <div className="text-5xl opacity-30">◍</div>
+    <div className="fixed inset-0 z-50 bg-black overflow-y-scroll snap-y snap-mandatory overscroll-y-contain">
+      <button onClick={onClose} aria-label="Close feed"
+        className="fixed top-4 left-4 z-[55] w-10 h-10 rounded-full bg-black/40 text-white grid place-items-center backdrop-blur">✕</button>
+      {videos.map((v, i) => (
+        <FeedItem key={v.site + "/" + v.id} v={v} index={i} active={i === current} near={Math.abs(i - current) <= 1}
+          preload={i === current || i === current + 1 ? "auto" : "metadata"}
+          muted={muted} onVisible={onVisible} onToggleMute={onToggleMute} onOpenModel={onOpenModel}
+          collections={collections} allLabels={allLabels} onChanged={onChanged} />
+      ))}
+    </div>
+  );
+}
+
+function FeedAction({ icon, label, onClick }: { icon: string; label: string; onClick: () => void }) {
+  return (
+    <button onClick={onClick} className="flex flex-col items-center gap-1 text-white drop-shadow">
+      <span className="text-3xl leading-none">{icon}</span>
+      <span className="text-[11px] font-medium">{label}</span>
+    </button>
+  );
+}
+
+function FeedItem({ v, index, active, near, muted, preload, onVisible, onToggleMute, onOpenModel, collections, allLabels, onChanged }:
+  { v: Video; index: number; active: boolean; near: boolean; muted: boolean; preload: "auto" | "metadata";
+    onVisible: (i: number) => void; onToggleMute: () => void; onOpenModel: (name: string) => void;
+    collections: Collection[]; allLabels: string[]; onChanged: () => void }) {
+  const secRef = useRef<HTMLElement>(null);
+  const vidRef = useRef<HTMLVideoElement | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [fav, setFav] = useState(!!v.favorite);
+  const [showColl, setShowColl] = useState(false);
+  const [showLabels, setShowLabels] = useState(false);
+  const primary = (v.models && v.models[0]) || "";
+
+  // Mark this item active when it scrolls into view (drives play/pause + windowing).
+  useEffect(() => {
+    const el = secRef.current; if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => { if (entries[0].isIntersecting && entries[0].intersectionRatio >= 0.6) onVisible(index); },
+      { threshold: [0.6] });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [onVisible, index]);
+
+  // Autoplay the in-view video; pause + rewind the others.
+  useEffect(() => {
+    const vid = vidRef.current; if (!vid) return;
+    if (active) { setPaused(false); vid.play().catch(() => {}); MarkWatched(v.site, v.id); }
+    else { vid.pause(); try { vid.currentTime = 0; } catch {} }
+  }, [active, v.site, v.id]);
+
+  const tap = () => {
+    const vid = vidRef.current; if (!vid) return;
+    if (vid.paused) { vid.play().catch(() => {}); setPaused(false); } else { vid.pause(); setPaused(true); }
+  };
+  const like = async () => { const nf = !fav; setFav(nf); v.favorite = nf; await SetFavorite(v.site, v.id, nf); };
+
+  return (
+    <section ref={secRef} className="snap-start snap-always snapcell relative w-full flex items-center justify-center" style={{ height: "100dvh" }}>
+      {near
+        ? <video ref={(el) => { vidRef.current = el; if (el) el.defaultMuted = true; /* iOS: must be muted before first play() */ }}
+            src={videoURL(v.filepath)} loop playsInline muted={muted} preload={preload}
+            poster={v.thumbnail ? mediaURL(v.thumbnail) : undefined}
+            onCanPlay={() => { const el = vidRef.current; if (active && !paused && el?.paused) el.play().catch(() => {}); }}
+            className="max-w-full max-h-full" onClick={tap} />
+        : v.thumbnail
+          ? <img src={mediaURL(v.thumbnail)} loading="lazy" decoding="async" className="max-w-full max-h-full object-contain opacity-60" />
+          : null}
+
+      {paused && <div className="absolute inset-0 grid place-items-center pointer-events-none text-white/85 text-7xl drop-shadow">▶</div>}
+
+      <button onClick={onToggleMute} aria-label="Toggle sound"
+        className="absolute top-4 right-4 w-10 h-10 grid place-items-center rounded-full bg-black/40 text-white text-lg backdrop-blur">
+        {muted ? "🔇" : "🔊"}
+      </button>
+
+      <div className="absolute right-3 bottom-28 flex flex-col items-center gap-5">
+        <FeedAction icon={fav ? "❤️" : "🤍"} label="Like" onClick={like} />
+        <FeedAction icon="📁" label="Save" onClick={() => setShowColl(true)} />
+        <FeedAction icon="🏷️" label="Tag" onClick={() => setShowLabels(true)} />
+      </div>
+
+      <div className="absolute left-4 right-16 bottom-24 text-white cap">
+        {primary && <button onClick={() => onOpenModel(primary)} className="font-semibold text-white text-base">{primary}</button>}
+        <div className="text-sm text-white/90 line-clamp-2 mt-0.5">{v.title || v.uploader}</div>
+        {v.labels && v.labels.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {v.labels.slice(0, 4).map((l) => <span key={l} className="text-[11px] bg-white/15 backdrop-blur px-2 py-0.5 rounded-full">{l}</span>)}
+          </div>
+        )}
+      </div>
+
+      {showColl && (
+        <AddToCollectionModal refs={[{ site: v.site, id: v.id }]} collections={collections}
+          onClose={() => setShowColl(false)} onChanged={onChanged} />
+      )}
+      {showLabels && (
+        <LabelEditor video={v} allLabels={allLabels} onClose={() => setShowLabels(false)} onChanged={onChanged} />
+      )}
+    </section>
+  );
+}
+
+// LabelEditor adds/removes a video's categories (reusable; used from the feed).
+function LabelEditor({ video, allLabels, onClose, onChanged }:
+  { video: Video; allLabels: string[]; onClose: () => void; onChanged: () => void }) {
+  const [labels, setLabels] = useState<string[]>(video.labels || []);
+  const [input, setInput] = useState("");
+  const commit = async (next: string[]) => { setLabels(next); video.labels = next; await SetLabels(video.site, video.id, next); onChanged(); };
+  const add = () => { const l = input.trim(); setInput(""); if (l && !labels.includes(l)) commit([...labels, l]); };
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] grid place-items-center p-4" onClick={onClose}>
+      <div className="bg-panel border border-edge rounded-xl p-5 w-[92vw] max-w-[26rem] pop" onClick={(e) => e.stopPropagation()}>
+        <div className="font-semibold mb-1">Tags</div>
+        <p className="text-xs text-muted mb-3">Tag this video so it shows up under Tags.</p>
+        <div className="flex flex-wrap gap-2 mb-3 min-h-[2rem]">
+          {labels.length === 0 && <span className="text-xs text-muted py-1">No tags yet</span>}
+          {labels.map((l) => (
+            <span key={l} className="flex items-center gap-1 bg-panel2 border border-edge rounded-full px-3 py-1 text-sm">
+              {l} <button onClick={() => commit(labels.filter((x) => x !== l))} className="text-muted hover:text-rose-400">×</button>
+            </span>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <input list="feed-labels" value={input} autoFocus onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") add(); }} placeholder="Add a tag…"
+            className="flex-1 bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent" />
+          <button onClick={add} className="text-sm font-medium px-3 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">Add</button>
+          <datalist id="feed-labels">{allLabels.map((l) => <option key={l} value={l} />)}</datalist>
+        </div>
+        <div className="flex justify-end mt-4"><button onClick={onClose} className="text-sm text-muted hover:text-fg px-3 py-2">Done</button></div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Bottom tab bar (mobile) ---------------- */
+
+function TabBar({ route, onGo, onMore, navOpen }:
+  { route: Route; onGo: (r: Route) => void; onMore: () => void; navOpen: boolean }) {
+  const tabs = [
+    { key: "home", label: "Home", icon: "home", active: route.kind === "home", onClick: () => onGo({ kind: "home" }) },
+    { key: "feed", label: "Feed", icon: "feed", active: route.kind === "feed", onClick: () => onGo({ kind: "feed" }) },
+    { key: "library", label: "People", icon: "people", active: route.kind === "library" || route.kind === "model", onClick: () => onGo({ kind: "library" }) },
+    { key: "favorites", label: "Favorites", icon: "heart", active: route.kind === "favorites", onClick: () => onGo({ kind: "favorites" }) },
+    { key: "more", label: "More", icon: "menu", active: navOpen, onClick: onMore },
+  ];
+  return (
+    <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 flex glass border-t border-edge/70"
+      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
+      {tabs.map((t) => (
+        <button key={t.key} onClick={t.onClick}
+          className={`flex-1 flex flex-col items-center gap-1 pt-2 pb-2 text-[11px] ${t.active ? "text-fg font-bold" : "text-muted font-medium"}`}>
+          <span className={`w-12 h-7 grid place-items-center rounded-full leading-none transition ${t.active ? "bg-accent/20" : ""}`}
+            style={t.active ? { color: "var(--ac)" } : undefined}><Icon name={t.icon} className="w-[20px] h-[20px]" /></span>
+          {t.label}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+function Empty({ children, icon = "◍", action }: { children: any; icon?: string; action?: { label: string; onClick: () => void } }) {
+  return (
+    <div className="flex flex-col items-center justify-center text-muted py-24 gap-4 rise">
+      <div className="w-20 h-20 rounded-full bg-panel2 grid place-items-center text-4xl text-muted/50">{icon}</div>
       <div className="text-sm text-center max-w-sm leading-relaxed">{children}</div>
+      {action && <button onClick={action.onClick} className="glow-btn px-5 py-2 text-sm">{action.label}</button>}
+    </div>
+  );
+}
+
+// CardGridSkeleton mirrors the video grid layout while a view loads.
+function CardGridSkeleton({ count = 12, ratio = "aspect-video" }: { count?: number; ratio?: string }) {
+  return (
+    <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,290px),1fr))" }}>
+      {Array.from({ length: count }).map((_, i) => <div key={i} className={`skel ${ratio}`} />)}
     </div>
   );
 }

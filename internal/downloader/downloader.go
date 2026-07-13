@@ -8,10 +8,12 @@ import (
 	"hash/fnv"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +41,7 @@ type Config struct {
 	YtDlp      string
 	FfmpegDir  string
 	MediaRoot  string
+	StateDir   string // .keepsake: where the sync cache (and other state) lives
 	Archive    string
 	CookieSpec string // "" | "browser:<name>" | "file:<path>"
 }
@@ -50,17 +53,44 @@ type Downloader struct {
 	emit  func(event string, data any)
 	jobs  map[string]*Job
 	order []string
-	queue chan string
+	wake  chan struct{} // buffered(1): nudges the worker that new work may exist
+	seq   uint64        // monotonic id source (guarded by mu)
 	mu    sync.Mutex
+
+	enumMu    sync.Mutex
+	enumCache map[string]*SyncList // sync URL -> saved enumeration (persisted)
+}
+
+// SyncList is a saved enumeration of a remote URL (channel / favorites / list),
+// with the metadata the Sync page shows: a friendly title, what kind it is, and
+// when it was last fetched.
+type SyncList struct {
+	URL       string       `json:"url"`
+	Title     string       `json:"title"`
+	Kind      string       `json:"kind"` // favorites | pornstar | model | channel | user | list
+	FetchedAt string       `json:"fetchedAt"`
+	Items     []RemoteItem `json:"items"`
+}
+
+// SyncSummary is the at-a-glance card for a saved sync (counts computed live
+// against the download archive).
+type SyncSummary struct {
+	URL       string `json:"url"`
+	Title     string `json:"title"`
+	Kind      string `json:"kind"`
+	FetchedAt string `json:"fetchedAt"`
+	Count     int    `json:"count"`
+	Owned     int    `json:"owned"`
+	New       int    `json:"new"`
 }
 
 func New(cfg Config, db *library.DB, emit func(string, any)) *Downloader {
 	d := &Downloader{
-		cfg:   cfg,
-		db:    db,
-		emit:  emit,
-		jobs:  map[string]*Job{},
-		queue: make(chan string, 256),
+		cfg:  cfg,
+		db:   db,
+		emit: emit,
+		jobs: map[string]*Job{},
+		wake: make(chan struct{}, 1),
 	}
 	go d.worker()
 	return d
@@ -101,20 +131,53 @@ func (d *Downloader) cookieArgs() []string {
 	d.mu.Unlock()
 	switch {
 	case strings.HasPrefix(spec, "file:"):
-		return []string{"--cookies", strings.TrimPrefix(spec, "file:")}
+		p := strings.TrimPrefix(spec, "file:")
+		if validCookieFile(p) {
+			return []string{"--cookies", p}
+		}
+		return nil // missing/corrupt cookie file — download without it rather than failing
 	case strings.HasPrefix(spec, "browser:"):
 		return []string{"--cookies-from-browser", strings.TrimPrefix(spec, "browser:")}
 	}
 	return nil
 }
 
-// Enumerate lists the videos in a model/playlist/favorites URL (fast, metadata
-// only) and flags which you already own.
-func (d *Downloader) Enumerate(listURL string) ([]RemoteItem, error) {
+// validCookieFile reports whether path is a usable Netscape cookie file. A
+// zeroed/corrupt or headerless file is rejected so it can't break every download.
+func validCookieFile(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	s := string(data)
+	if strings.IndexByte(s, 0) >= 0 { // null bytes = corruption
+		return false
+	}
+	if strings.Contains(s, "# Netscape HTTP Cookie File") || strings.Contains(s, "# HTTP Cookie File") {
+		return true
+	}
+	for _, ln := range strings.Split(s, "\n") { // or at least one real cookie line
+		if !strings.HasPrefix(ln, "#") && strings.Count(ln, "\t") >= 6 {
+			return true
+		}
+	}
+	return false
+}
+
+// Enumerate lists the videos in a model/playlist/favorites URL and flags which
+// you already own. Results are cached per-URL (persisted in the vault) so the
+// slow yt-dlp fetch is skipped on revisits; pass refresh=true to re-fetch.
+func (d *Downloader) Enumerate(listURL string, refresh bool) ([]RemoteItem, error) {
 	listURL = strings.TrimSpace(listURL)
 	if listURL == "" {
 		return nil, nil
 	}
+	if !refresh {
+		if cached := d.cachedEnum(listURL); len(cached) > 0 {
+			return d.withOwned(cached), nil // recompute "owned" against the current archive
+		}
+	}
+
 	args := []string{"--ignore-config", "--flat-playlist", "--no-warnings",
 		"--print", "%(url)s %(title)s"}
 	args = append(args, d.cookieArgs()...)
@@ -132,7 +195,6 @@ func (d *Downloader) Enumerate(listURL string) ([]RemoteItem, error) {
 		time.Sleep(1500 * time.Millisecond) // transient anti-bot block — retry once
 		out = runOnce()
 	}
-	owned := d.archiveSet()
 	var items []RemoteItem
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
@@ -143,13 +205,178 @@ func (d *Downloader) Enumerate(listURL string) ([]RemoteItem, error) {
 		if sp := strings.IndexByte(line, ' '); sp >= 0 {
 			url, title = line[:sp], strings.TrimSpace(line[sp+1:])
 		}
-		id := viewkey(url)
-		items = append(items, RemoteItem{
-			URL: url, Title: title, ID: id,
-			Owned: id != "" && owned["pornhub "+id],
+		items = append(items, RemoteItem{URL: url, Title: title, ID: viewkey(url)})
+	}
+	if len(items) > 0 {
+		d.storeEnum(listURL, items) // only cache a successful fetch
+	}
+	return d.withOwned(items), nil
+}
+
+// ---- sync-list cache (so re-syncing a channel/favorites is instant) ----
+
+func (d *Downloader) syncCachePath() string {
+	dir := d.cfg.StateDir
+	if dir == "" {
+		dir = d.cfg.MediaRoot // back-compat (e.g. tests that don't set StateDir)
+	}
+	return filepath.Join(dir, "sync_cache.json")
+}
+
+func (d *Downloader) loadEnumCache() {
+	d.enumMu.Lock()
+	defer d.enumMu.Unlock()
+	if d.enumCache != nil {
+		return
+	}
+	d.enumCache = map[string]*SyncList{}
+	data, err := os.ReadFile(d.syncCachePath())
+	if err != nil {
+		return
+	}
+	if json.Unmarshal(data, &d.enumCache) == nil {
+		return
+	}
+	// Migrate the old format (map[url][]RemoteItem) into the richer SyncList.
+	d.enumCache = map[string]*SyncList{}
+	var old map[string][]RemoteItem
+	if json.Unmarshal(data, &old) == nil {
+		for u, items := range old {
+			d.enumCache[u] = &SyncList{URL: u, Title: deriveTitle(u), Kind: deriveKind(u), Items: items}
+		}
+	}
+}
+
+func (d *Downloader) cachedEnum(url string) []RemoteItem {
+	d.loadEnumCache()
+	d.enumMu.Lock()
+	defer d.enumMu.Unlock()
+	if sl := d.enumCache[url]; sl != nil {
+		return sl.Items
+	}
+	return nil
+}
+
+func (d *Downloader) storeEnum(u string, items []RemoteItem) {
+	d.loadEnumCache()
+	d.enumMu.Lock()
+	d.enumCache[u] = &SyncList{
+		URL: u, Title: deriveTitle(u), Kind: deriveKind(u),
+		FetchedAt: time.Now().Format("2006-01-02 15:04:05"), Items: items,
+	}
+	data, _ := json.MarshalIndent(d.enumCache, "", " ")
+	d.enumMu.Unlock()
+	_ = os.WriteFile(d.syncCachePath(), data, 0o644)
+}
+
+// SyncedLists returns saved syncs with live owned/new counts, newest fetch first.
+func (d *Downloader) SyncedLists() []SyncSummary {
+	d.loadEnumCache()
+	owned := d.archiveSet()
+	d.enumMu.Lock()
+	defer d.enumMu.Unlock()
+	out := make([]SyncSummary, 0, len(d.enumCache))
+	for _, sl := range d.enumCache {
+		o, n := 0, 0
+		for _, it := range sl.Items {
+			if it.ID != "" && owned["pornhub "+it.ID] {
+				o++
+			} else {
+				n++
+			}
+		}
+		out = append(out, SyncSummary{
+			URL: sl.URL, Title: sl.Title, Kind: sl.Kind, FetchedAt: sl.FetchedAt,
+			Count: len(sl.Items), Owned: o, New: n,
 		})
 	}
-	return items, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].FetchedAt > out[j].FetchedAt })
+	return out
+}
+
+// RemoveSync forgets a saved sync.
+func (d *Downloader) RemoveSync(u string) {
+	d.loadEnumCache()
+	d.enumMu.Lock()
+	delete(d.enumCache, u)
+	data, _ := json.MarshalIndent(d.enumCache, "", " ")
+	d.enumMu.Unlock()
+	_ = os.WriteFile(d.syncCachePath(), data, 0o644)
+}
+
+func deriveKind(u string) string {
+	lu := strings.ToLower(u)
+	switch {
+	case strings.Contains(lu, "favorit"):
+		return "favorites"
+	case strings.Contains(lu, "/pornstar/"):
+		return "pornstar"
+	case strings.Contains(lu, "/model/"):
+		return "model"
+	case strings.Contains(lu, "/channel"):
+		return "channel"
+	case strings.Contains(lu, "/users/"):
+		return "user"
+	}
+	return "list"
+}
+
+var syncSlugRe = regexp.MustCompile(`(?i)/(?:model|pornstar|channels?|users)/([^/?#]+)`)
+
+// deriveTitle makes a friendly name from a sync URL (the performer/channel, or
+// "<Name> — favorites" for a favorites list).
+func deriveTitle(u string) string {
+	m := syncSlugRe.FindStringSubmatch(u)
+	if strings.Contains(strings.ToLower(u), "favorit") {
+		if len(m) > 1 {
+			return prettySlug(m[1]) + " — favorites"
+		}
+		return "Favorites"
+	}
+	if len(m) > 1 {
+		return prettySlug(m[1])
+	}
+	s := strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://")
+	s = strings.TrimPrefix(s, "www.")
+	if len(s) > 40 {
+		s = s[:40]
+	}
+	return s
+}
+
+func prettySlug(s string) string {
+	if dec, err := url.QueryUnescape(s); err == nil {
+		s = dec
+	}
+	s = strings.NewReplacer("-", " ", "_", " ").Replace(s)
+	words := strings.Fields(s)
+	for i, w := range words {
+		words[i] = strings.ToUpper(w[:1]) + w[1:]
+	}
+	return strings.Join(words, " ")
+}
+
+// withOwned returns a copy of items with the Owned flag set from the current archive.
+func (d *Downloader) withOwned(items []RemoteItem) []RemoteItem {
+	owned := d.archiveSet()
+	out := make([]RemoteItem, len(items))
+	for i, it := range items {
+		it.Owned = it.ID != "" && owned["pornhub "+it.ID]
+		out[i] = it
+	}
+	return out
+}
+
+// SyncedURLs returns the URLs that have a cached enumeration (for a "saved syncs" list).
+func (d *Downloader) SyncedURLs() []string {
+	d.loadEnumCache()
+	d.enumMu.Lock()
+	defer d.enumMu.Unlock()
+	out := make([]string, 0, len(d.enumCache))
+	for u := range d.enumCache {
+		out = append(out, u)
+	}
+	return out
 }
 
 func (d *Downloader) archiveSet() map[string]bool {
@@ -177,22 +404,67 @@ func viewkey(u string) string {
 	return ""
 }
 
-func newID() string { return strconv.FormatInt(time.Now().UnixNano(), 36) }
+// nextID returns a process-unique job id. Caller must hold d.mu (a monotonic
+// counter avoids the nanosecond-collision bug under parallel enqueues).
+func (d *Downloader) nextID() string {
+	d.seq++
+	return strconv.FormatUint(d.seq, 36)
+}
 
-// Enqueue adds a URL to the queue and returns its job id.
+// notify wakes the worker without ever blocking the caller.
+func (d *Downloader) notify() {
+	select {
+	case d.wake <- struct{}{}:
+	default:
+	}
+}
+
+// addLocked queues url unless it's already in flight. Caller holds d.mu.
+func (d *Downloader) addLocked(url string) (string, bool) {
+	for _, jid := range d.order {
+		if j := d.jobs[jid]; j != nil && j.URL == url && (j.Status == "queued" || j.Status == "downloading") {
+			return jid, false // duplicate — already queued or downloading
+		}
+	}
+	id := d.nextID()
+	d.jobs[id] = &Job{ID: id, URL: url, Title: url, Status: "queued"}
+	d.order = append(d.order, id)
+	return id, true
+}
+
+// Enqueue adds a single URL (deduped against in-flight jobs) and returns its id.
 func (d *Downloader) Enqueue(url string) string {
 	url = strings.TrimSpace(url)
 	if url == "" {
 		return ""
 	}
-	id := newID()
 	d.mu.Lock()
-	d.jobs[id] = &Job{ID: id, URL: url, Title: url, Status: "queued"}
-	d.order = append(d.order, id)
+	id, added := d.addLocked(url)
 	d.mu.Unlock()
-	d.queue <- id
-	d.emitQueue()
+	if added {
+		d.notify()
+		d.emitQueue()
+	}
 	return id
+}
+
+// EnqueueMany adds many URLs at once (deduped). Returns how many were newly queued.
+func (d *Downloader) EnqueueMany(urls []string) int {
+	added := 0
+	d.mu.Lock()
+	for _, u := range urls {
+		if u = strings.TrimSpace(u); u != "" {
+			if _, ok := d.addLocked(u); ok {
+				added++
+			}
+		}
+	}
+	d.mu.Unlock()
+	if added > 0 {
+		d.notify()
+		d.emitQueue()
+	}
+	return added
 }
 
 func (d *Downloader) RemoveJob(id string) {
@@ -236,14 +508,21 @@ func (d *Downloader) emitQueue() {
 }
 
 func (d *Downloader) worker() {
-	for id := range d.queue {
+	for {
 		d.mu.Lock()
-		j, ok := d.jobs[id]
-		ready := ok && j.Status == "queued"
-		d.mu.Unlock()
-		if ready {
-			d.run(j)
+		var next *Job
+		for _, jid := range d.order { // first still-queued job, in order
+			if j := d.jobs[jid]; j != nil && j.Status == "queued" {
+				next = j
+				break
+			}
 		}
+		d.mu.Unlock()
+		if next == nil {
+			<-d.wake // idle — wait for new work
+			continue
+		}
+		d.run(next)
 	}
 }
 
@@ -269,19 +548,17 @@ func (d *Downloader) run(j *Job) {
 		"--write-info-json",
 		"--write-thumbnail",
 		"--no-warnings", "--newline", "--no-simulate",
+		"--socket-timeout", "30", // abort a dead socket instead of hanging forever
+		"--retries", "10", "--fragment-retries", "10", // ride out transient stalls
+		"--no-continue", // tokened CDNs (go.porn) don't resume cleanly — a stale .part hangs forever; always fetch fresh
 		"--progress-template",
-		"download:[[PROG]]%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
+		"download:[[PROG]]%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s",
 		"--print", "after_move:[[DONE]]%(filepath)s",
 	}
 	if cfg.FfmpegDir != "" {
 		args = append(args, "--ffmpeg-location", cfg.FfmpegDir)
 	}
-	switch {
-	case strings.HasPrefix(cfg.CookieSpec, "browser:"):
-		args = append(args, "--cookies-from-browser", strings.TrimPrefix(cfg.CookieSpec, "browser:"))
-	case strings.HasPrefix(cfg.CookieSpec, "file:"):
-		args = append(args, "--cookies", strings.TrimPrefix(cfg.CookieSpec, "file:"))
-	}
+	args = append(args, d.cookieArgs()...) // validated; skips a missing/corrupt cookie file
 	args = append(args, j.URL)
 
 	cmd := exec.Command(cfg.YtDlp, args...)
@@ -296,24 +573,104 @@ func (d *Downloader) run(j *Job) {
 		d.finish(j, nil, err, "Couldn't start yt-dlp: "+err.Error())
 		return
 	}
+
+	// Stall watchdog: if the download makes no byte progress for stallTimeout,
+	// kill yt-dlp (and its child) and move on — so one dead connection can't
+	// freeze the whole queue. Any non-progress output (retries, merge, post-
+	// processing) counts as activity, so a working merge is never killed.
+	const stallTimeout = 2 * time.Minute
+	var pmu sync.Mutex
+	var lastBytes int64 = -1
+	lastActive := time.Now()
+	stalled := false
+	watchDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchDone:
+				return
+			case <-t.C:
+				pmu.Lock()
+				idle := time.Since(lastActive)
+				pmu.Unlock()
+				if idle > stallTimeout {
+					pmu.Lock()
+					stalled = true
+					pmu.Unlock()
+					killTree(cmd)
+					return
+				}
+			}
+		}
+	}()
+
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
+		if i := strings.Index(line, "[[PROG]]"); i >= 0 {
+			payload := line[i+8:]
+			d.applyProgress(j, payload)
+			if b := progBytes(payload); b > lastBytes { // real download progress only
+				pmu.Lock()
+				lastBytes = b
+				lastActive = time.Now()
+				pmu.Unlock()
+			}
+			continue
+		}
+		// any non-progress line = activity (retries, post-processing, merge)
+		pmu.Lock()
+		lastActive = time.Now()
+		pmu.Unlock()
 		switch {
-		case strings.Contains(line, "[[PROG]]"):
-			d.applyProgress(j, line[strings.Index(line, "[[PROG]]")+8:])
 		case strings.Contains(line, "[[DONE]]"):
 			saved = append(saved, strings.TrimSpace(line[strings.Index(line, "[[DONE]]")+8:]))
 		case strings.Contains(line, "ERROR:"):
 			lastErr = line // errors still print even in --print/quiet mode
 		}
 	}
-	d.finish(j, saved, cmd.Wait(), lastErr)
+	close(watchDone)
+	runErr := cmd.Wait()
+	pmu.Lock()
+	wasStalled := stalled
+	pmu.Unlock()
+	if wasStalled && lastErr == "" {
+		lastErr = "ERROR: Stalled — no data for over 2 minutes; skipped to keep the queue moving."
+	}
+	d.finish(j, saved, runErr, lastErr)
+}
+
+// progBytes extracts downloaded_bytes (the 4th field) from a progress payload.
+func progBytes(payload string) int64 {
+	parts := strings.Split(payload, "|")
+	if len(parts) < 4 {
+		return -1
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(parts[3]), 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// killTree force-kills a process and its children. yt-dlp's PyInstaller bootloader
+// spawns a child that must also die, or the download keeps running orphaned.
+func killTree(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	_ = cmd.Process.Kill()
+	k := exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid))
+	k.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	_ = k.Run()
 }
 
 func (d *Downloader) applyProgress(j *Job, payload string) {
-	parts := strings.SplitN(payload, "|", 3)
+	parts := strings.SplitN(payload, "|", 4) // 4th field (downloaded_bytes) used by the watchdog
 	d.mu.Lock()
 	if len(parts) > 0 {
 		if p, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(parts[0]), "%"), 64); err == nil {
@@ -726,6 +1083,140 @@ func (d *Downloader) importOne(src, model string) bool {
 		Duration: dur, Width: w, Height: h,
 		Ext:      strings.TrimPrefix(filepath.Ext(dest), "."),
 		Filepath: dest, Filename: base,
+		Thumbnail: thumb,
+		Filesize:  size,
+		Added:     time.Now().Format("2006-01-02 15:04:05"),
+	}
+	return d.db.Upsert(v) == nil
+}
+
+// ---- rebuild catalogue from disk --------------------------------------
+
+// RebuildFromDisk re-catalogues the vault by scanning it: every yt-dlp download
+// is re-ingested from its .info.json sidecar, and every video sitting directly
+// in Local/<model>/ is catalogued in place. Upsert keeps user data (model
+// assignments, favorites, labels) on rows that already exist, and collection
+// membership is keyed by site+id, so nothing the user set is lost. This both
+// rebuilds the library if the DB is gone and re-points filepaths after a manual
+// reorganisation. Returns how many media files were catalogued.
+func (d *Downloader) RebuildFromDisk() (int, error) {
+	root := d.cfg.MediaRoot
+	if root == "" {
+		return 0, nil
+	}
+	n := 0
+	sep := string(filepath.Separator)
+
+	// 1) Downloads: ingest the media beside every .info.json sidecar.
+	_ = filepath.WalkDir(root, func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if e.IsDir() {
+			if e.Name() == stateDirBase { // skip .keepsake
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(p), ".info.json") {
+			return nil
+		}
+		stem := strings.TrimSuffix(p, ".info.json")
+		if media := findMediaFile(stem); media != "" {
+			if _, ok := d.ingest(media); ok {
+				n++
+			}
+		}
+		return nil
+	})
+
+	// 2) Local imports (no sidecar): catalogue videos directly in Local/<model>/.
+	// We deliberately don't descend into uploads/ (those were copied up to the
+	// model folder on import) to avoid cataloguing a file twice.
+	localRoot := filepath.Join(root, "Local")
+	_ = filepath.WalkDir(localRoot, func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(localRoot, p)
+		if e.IsDir() {
+			if rel != "." && strings.Contains(rel, sep) {
+				return fs.SkipDir // deeper than Local/<model> (uploads/, photos/)
+			}
+			return nil
+		}
+		if !videoExts[strings.ToLower(filepath.Ext(p))] {
+			return nil
+		}
+		parts := strings.Split(rel, sep)
+		if len(parts) != 2 { // must be exactly Local/<model>/<file>
+			return nil
+		}
+		stem := strings.TrimSuffix(p, filepath.Ext(p))
+		if _, err := os.Stat(stem + ".info.json"); err == nil {
+			return nil // already ingested via the sidecar pass
+		}
+		model := parts[0]
+		if model == "Unassigned" {
+			model = ""
+		}
+		if d.catalogInPlace(p, model) {
+			n++
+		}
+		return nil
+	})
+
+	d.emitQueue()
+	return n, nil
+}
+
+// stateDirBase mirrors core's .keepsake folder name so a rebuild scan skips it.
+const stateDirBase = ".keepsake"
+
+// findMediaFile returns the video file sharing stem (the part before .info.json).
+func findMediaFile(stem string) string {
+	for ext := range videoExts {
+		if _, err := os.Stat(stem + ext); err == nil {
+			return stem + ext
+		}
+	}
+	return ""
+}
+
+// catalogInPlace records a Local video exactly where it sits (no copy). The id
+// matches importOne's (hash of the final path), so re-running upserts the same
+// row and preserves the user's model/favorite/label edits.
+func (d *Downloader) catalogInPlace(path, model string) bool {
+	dur, w, h := d.ffprobeInfo(path)
+	stem := strings.TrimSuffix(path, filepath.Ext(path))
+	thumb := findThumb(stem)
+	if thumb == "" {
+		var df *float64
+		if dur != nil {
+			f := float64(*dur)
+			df = &f
+		}
+		thumb = d.makeThumb(path, stem, df)
+	}
+	var size *int64
+	if st, err := os.Stat(path); err == nil {
+		s := st.Size()
+		size = &s
+	}
+	var models []string
+	if strings.TrimSpace(model) != "" {
+		models = []string{model}
+	}
+	v := library.Video{
+		ID:       "local_" + hashStr(path),
+		Site:     "Local",
+		Title:    cleanTitle(filepath.Base(path)),
+		Uploader: model,
+		Models:   models,
+		Duration: dur, Width: w, Height: h,
+		Ext:       strings.TrimPrefix(filepath.Ext(path), "."),
+		Filepath:  path,
+		Filename:  filepath.Base(path),
 		Thumbnail: thumb,
 		Filesize:  size,
 		Added:     time.Now().Format("2006-01-02 15:04:05"),

@@ -1,18 +1,24 @@
 package library
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
 
 func TestMigrateRealLibrary(t *testing.T) {
+	const jsonPath = `C:\MediaVault\library.json`
+	if _, err := os.Stat(jsonPath); err != nil {
+		t.Skipf("no real library at %s — skipping migration smoke test", jsonPath)
+	}
+
 	db, err := Open(filepath.Join(t.TempDir(), "test.db"), `C:\MediaVault`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	n, err := db.MigrateFromJSON(`C:\MediaVault\library.json`)
+	n, err := db.MigrateFromJSON(jsonPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +38,7 @@ func TestMigrateRealLibrary(t *testing.T) {
 		if i >= 3 {
 			break
 		}
-		t.Logf("  top model: %s / %s — %d videos, %ds, hasThumb=%v",
-			m.Site, m.Uploader, m.Count, m.TotalSeconds, m.Thumbnail != "")
+		t.Logf("  top model: %s [%s] — %d videos, %ds, hasThumb=%v",
+			m.Name, m.Sites, m.Count, m.TotalSeconds, m.Thumbnail != "")
 	}
 }

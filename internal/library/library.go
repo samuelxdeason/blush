@@ -43,6 +43,7 @@ type Video struct {
 	WatchedAt    string   `json:"watched_at"`
 	Favorite     bool     `json:"favorite"`
 	Labels       []string `json:"labels"` // user categories/tags
+	Position     *float64 `json:"position"` // resume point in seconds (0/nil = start)
 }
 
 // Model summarises one (editable) model grouping for the unified library.
@@ -127,6 +128,7 @@ CREATE TABLE IF NOT EXISTS videos (
   watched_at    TEXT,
   favorite      INTEGER DEFAULT 0,
   labels        TEXT,
+  position      REAL,
   PRIMARY KEY (site, id)
 );
 CREATE INDEX IF NOT EXISTS idx_videos_model ON videos(site, uploader);
@@ -145,7 +147,23 @@ CREATE TABLE IF NOT EXISTS model_info (
   links   TEXT,
   cover   TEXT,
   updated TEXT
-);`
+);
+CREATE TABLE IF NOT EXISTS collections (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  name    TEXT NOT NULL,
+  hidden  INTEGER NOT NULL DEFAULT 0,
+  locked  INTEGER NOT NULL DEFAULT 0,
+  created TEXT
+);
+CREATE TABLE IF NOT EXISTS collection_items (
+  collection_id INTEGER NOT NULL,
+  site          TEXT NOT NULL,
+  video_id      TEXT NOT NULL,
+  added         TEXT,
+  PRIMARY KEY (collection_id, site, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_collitems_coll  ON collection_items(collection_id);
+CREATE INDEX IF NOT EXISTS idx_collitems_video ON collection_items(site, video_id);`
 
 // Open creates/opens the catalogue at path. root is the media root that stored
 // relative paths resolve against.
@@ -172,6 +190,7 @@ func Open(path, root string) (*DB, error) {
 	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN model TEXT`)
 	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN favorite INTEGER DEFAULT 0`)
 	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN labels TEXT`)
+	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN position REAL`)
 	// Backfill: existing rows adopt their uploader as the model (one-time; only
 	// touches rows where model is still NULL, i.e. right after the column is added).
 	_, _ = sqlDB.Exec(`UPDATE videos SET model = uploader WHERE model IS NULL`)
@@ -225,6 +244,13 @@ func parseModels(raw string) []string {
 }
 
 func (db *DB) Close() error { return db.sql.Close() }
+
+// Checkpoint folds the write-ahead log into the main db file so a plain file
+// copy (e.g. a backup) is self-contained.
+func (db *DB) Checkpoint() error {
+	_, err := db.sql.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
+}
 
 // abs resolves a stored (relative) path against the media root.
 func (db *DB) abs(p string) string {
@@ -343,9 +369,9 @@ func (db *DB) AllLabels() ([]string, error) {
 	return out, rows.Err()
 }
 
-// Favorites returns liked videos, newest first.
+// Favorites returns liked videos, newest first (hidden-collection items excluded).
 func (db *DB) Favorites() ([]Video, error) {
-	return db.query(`WHERE favorite=1 ORDER BY added DESC LIMIT 2000`)
+	return db.query(`WHERE favorite=1 AND ` + notHidden + ` ORDER BY added DESC LIMIT 2000`)
 }
 
 // LabelCount is a category and how many videos use it.
@@ -392,7 +418,7 @@ func (db *DB) LabelCounts() ([]LabelCount, error) {
 // VideosByLabel returns videos tagged with a category, newest first.
 func (db *DB) VideosByLabel(label string) ([]Video, error) {
 	b, _ := json.Marshal(label) // match the quoted token inside the JSON array
-	return db.query(`WHERE labels LIKE ? ORDER BY added DESC LIMIT 2000`, "%"+string(b)+"%")
+	return db.query(`WHERE labels LIKE ? AND `+notHidden+` ORDER BY added DESC LIMIT 2000`, "%"+string(b)+"%")
 }
 
 // ---- model profiles ----------------------------------------------------
@@ -445,6 +471,48 @@ func (db *DB) SetTitle(site, id, title string) error {
 	return err
 }
 
+// RemoveModelFromAll strips a model name from every video that lists it; videos
+// left with no models become Unassigned. Used to clean up junk model groupings.
+func (db *DB) RemoveModelFromAll(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return nil
+	}
+	b, _ := json.Marshal(name) // match the quoted token inside the JSON array
+	rows, err := db.sql.Query(`SELECT rowid, model FROM videos WHERE model LIKE ?`, "%"+string(b)+"%")
+	if err != nil {
+		return err
+	}
+	type item struct {
+		rowid int64
+		raw   string
+	}
+	var items []item
+	for rows.Next() {
+		var r int64
+		var m string
+		if rows.Scan(&r, &m) == nil {
+			items = append(items, item{r, m})
+		}
+	}
+	rows.Close()
+	for _, it := range items {
+		ms := parseModels(it.raw)
+		kept := make([]string, 0, len(ms))
+		for _, m := range ms {
+			if m != name {
+				kept = append(kept, m)
+			}
+		}
+		if len(kept) == len(ms) {
+			continue // LIKE false-positive; name not actually present
+		}
+		if _, err := db.sql.Exec(`UPDATE videos SET model=? WHERE rowid=?`, jsonArr(kept), it.rowid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // AddPhoto inserts/updates a photo (paths stored relative to root).
 func (db *DB) AddPhoto(p Photo) error {
 	_, err := db.sql.Exec(`
@@ -481,6 +549,29 @@ func (db *DB) MarkWatched(site, id, when string) error {
 	return err
 }
 
+// SetPosition stores the resume point (seconds) and stamps watched_at. Once a
+// video is effectively finished (>=95%) the point is cleared so it drops out of
+// Continue Watching instead of restarting from the very end.
+func (db *DB) SetPosition(site, id string, position, duration float64) error {
+	if position < 0 {
+		position = 0
+	}
+	if duration > 0 && position >= duration*0.95 {
+		position = 0
+	}
+	_, err := db.sql.Exec(`UPDATE videos SET position=?, watched_at=? WHERE site=? AND id=?`,
+		position, time.Now().Format("2006-01-02 15:04:05"), site, id)
+	return err
+}
+
+// ContinueWatching returns videos with an in-progress resume point, most recent
+// first (started past 15s and not yet near the end).
+func (db *DB) ContinueWatching(limit int) ([]Video, error) {
+	return db.query(`WHERE position IS NOT NULL AND position > 15
+		AND (duration IS NULL OR duration = 0 OR position < duration*0.92)
+		AND `+notHidden+` ORDER BY watched_at DESC LIMIT ?`, limit)
+}
+
 // Count returns the number of catalogued videos.
 func (db *DB) Count() (int, error) {
 	var n int
@@ -491,7 +582,7 @@ func (db *DB) Count() (int, error) {
 // Models returns the unified model list, aggregated across each video's model
 // set (a video can belong to several). Ordered by video count; "" = Unassigned.
 func (db *DB) Models() ([]Model, error) {
-	rows, err := db.sql.Query(`SELECT COALESCE(model,''), site, COALESCE(duration,0), COALESCE(filesize,0), COALESCE(thumbnail,'') FROM videos`)
+	rows, err := db.sql.Query(`SELECT COALESCE(model,''), site, COALESCE(duration,0), COALESCE(filesize,0), COALESCE(thumbnail,'') FROM videos WHERE ` + notHidden)
 	if err != nil {
 		return nil, err
 	}
@@ -604,9 +695,21 @@ func (db *DB) Stats() (Stats, error) {
 	return s, rows.Err()
 }
 
-const cols = `id,site,title,uploader,model,duration,width,height,ext,filepath,filename,` +
-	`thumbnail,thumbnail_url,webpage_url,upload_date,view_count,like_count,tags,` +
-	`categories,description,filesize,added,watched_at,favorite,labels`
+// cols is qualified with the videos table so the same SELECT works when a query
+// JOINs another table that shares column names (e.g. collection_items.site/added).
+const cols = `videos.id,videos.site,videos.title,videos.uploader,videos.model,videos.duration,` +
+	`videos.width,videos.height,videos.ext,videos.filepath,videos.filename,videos.thumbnail,` +
+	`videos.thumbnail_url,videos.webpage_url,videos.upload_date,videos.view_count,videos.like_count,` +
+	`videos.tags,videos.categories,videos.description,videos.filesize,videos.added,videos.watched_at,` +
+	`videos.favorite,videos.labels,videos.position`
+
+// notHidden is true for a video that is NOT a member of any hidden collection.
+// Default views AND this in so hidden content (e.g. an adult collection) stays
+// out of the normal library, search, and model grids — but a hidden collection's
+// own page (VideosByCollection) deliberately omits it so you can still see it.
+const notHidden = `NOT EXISTS (
+  SELECT 1 FROM collection_items ci JOIN collections c ON c.id = ci.collection_id
+  WHERE c.hidden = 1 AND ci.site = videos.site AND ci.video_id = videos.id)`
 
 func nint(n sql.NullInt64) *int {
 	if !n.Valid {
@@ -623,13 +726,17 @@ func scanVideo(rows *sql.Rows) (Video, error) {
 	var watched sql.NullString
 	var model, labels sql.NullString
 	var fav sql.NullInt64
+	var pos sql.NullFloat64
 	if err := rows.Scan(&v.ID, &v.Site, &v.Title, &v.Uploader, &model, &dur, &w, &h, &v.Ext,
 		&v.Filepath, &v.Filename, &v.Thumbnail, &v.ThumbnailURL, &v.WebpageURL,
-		&v.UploadDate, &vc, &lc, &tags, &cats, &v.Description, &fs, &v.Added, &watched, &fav, &labels); err != nil {
+		&v.UploadDate, &vc, &lc, &tags, &cats, &v.Description, &fs, &v.Added, &watched, &fav, &labels, &pos); err != nil {
 		return v, err
 	}
 	v.Models = parseModels(model.String)
 	v.Favorite = fav.Int64 == 1
+	if pos.Valid {
+		v.Position = &pos.Float64
+	}
 	if labels.String != "" {
 		_ = json.Unmarshal([]byte(labels.String), &v.Labels)
 	}
@@ -663,33 +770,35 @@ func (db *DB) query(where string, args ...any) ([]Video, error) {
 }
 
 // VideosByModel returns every video that includes a model ("" = Unassigned).
+// Hidden-collection items are excluded so an adult collection's videos don't
+// resurface on a model page in the normal library.
 func (db *DB) VideosByModel(name string) ([]Video, error) {
 	if name == "" {
-		return db.query(`WHERE model IS NULL OR model='' OR model='[]' ORDER BY added DESC, id`)
+		return db.query(`WHERE (model IS NULL OR model='' OR model='[]') AND ` + notHidden + ` ORDER BY added DESC, id`)
 	}
 	b, _ := json.Marshal(name) // match the quoted token in the JSON array
-	return db.query(`WHERE model LIKE ? ORDER BY added DESC, id`, "%"+string(b)+"%")
+	return db.query(`WHERE model LIKE ? AND `+notHidden+` ORDER BY added DESC, id`, "%"+string(b)+"%")
 }
 
 // VideosBySite returns every video for one source, newest first (the flat feed).
 func (db *DB) VideosBySite(site string) ([]Video, error) {
-	return db.query(`WHERE site=? ORDER BY added DESC, id LIMIT 2000`, site)
+	return db.query(`WHERE site=? AND `+notHidden+` ORDER BY added DESC, id LIMIT 2000`, site)
 }
 
 // RecentlyDownloaded returns the newest additions across all sources.
 func (db *DB) RecentlyDownloaded(limit int) ([]Video, error) {
-	return db.query(`ORDER BY added DESC LIMIT ?`, limit)
+	return db.query(`WHERE `+notHidden+` ORDER BY added DESC LIMIT ?`, limit)
 }
 
 // RecentlyWatched returns videos most recently opened in the player.
 func (db *DB) RecentlyWatched(limit int) ([]Video, error) {
-	return db.query(`WHERE watched_at IS NOT NULL AND watched_at<>'' ORDER BY watched_at DESC LIMIT ?`, limit)
+	return db.query(`WHERE watched_at IS NOT NULL AND watched_at<>'' AND `+notHidden+` ORDER BY watched_at DESC LIMIT ?`, limit)
 }
 
 // Search returns videos whose title, model, or uploader matches (blank = all).
 func (db *DB) Search(q string) ([]Video, error) {
 	like := "%" + q + "%"
-	return db.query(`WHERE title LIKE ? OR model LIKE ? OR uploader LIKE ? ORDER BY added DESC LIMIT 500`, like, like, like)
+	return db.query(`WHERE (title LIKE ? OR model LIKE ? OR uploader LIKE ?) AND `+notHidden+` ORDER BY added DESC LIMIT 500`, like, like, like)
 }
 
 // MigrateFromJSON imports a legacy library.json file, returning rows imported.
