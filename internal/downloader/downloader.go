@@ -114,6 +114,10 @@ type RemoteItem struct {
 // env returns the child environment with the yt-dlp folder prepended to PATH,
 // so yt-dlp can find sidecar tools that live beside it (e.g. phantomjs.exe,
 // which Pornhub's listing pages require to solve their JS challenge).
+// PYTHONUTF8=1 forces yt-dlp's piped output to UTF-8: without it, Windows
+// encodes --print paths in the ANSI code page, mangling emoji/non-Latin
+// filenames so the [[DONE]] path never matches the file on disk and the
+// download is saved but never catalogued.
 func (d *Downloader) env() []string {
 	dir := filepath.Dir(d.cfg.YtDlp)
 	var out []string
@@ -122,6 +126,7 @@ func (d *Downloader) env() []string {
 			out = append(out, e)
 		}
 	}
+	out = append(out, "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8")
 	return append(out, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
