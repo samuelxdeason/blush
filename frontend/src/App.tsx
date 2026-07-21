@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Models, VideosByModel, Search, RecentlyDownloaded, RecentlyWatched, ContinueWatching, MarkWatched, SetPosition, SetModels, SetTitle,
+  Models, VideosByModel, AllVideos, Search, RecentlyDownloaded, RecentlyWatched, ContinueWatching, MarkWatched, SetPosition, SetModels, SetTitle,
   SetFavorite, SetLabels, AllLabels, Favorites, LabelCounts, VideosByLabel, UnassignModel,
   Enqueue, EnqueueMany, Enumerate, SyncedLists, RemoveSync, Queue, RemoveJob, ClearFinished, Import, ImportFilesDialog, ImportFolderDialog,
   PhotosByModel, ImportPhotosDialog, GetModelInfo, SaveModelInfo, SetModelCover, SetAvatarFromURL, UploadAvatar, FetchAvatar, FetchAllAvatars,
@@ -56,6 +56,7 @@ const CAN_HOVER = window.matchMedia?.("(hover: hover) and (pointer: fine)").matc
 
 type Route =
   | { kind: "home" }
+  | { kind: "videos" }
   | { kind: "library" }
   | { kind: "feed" }
   | { kind: "model"; name: string }
@@ -143,6 +144,8 @@ function Icon({ name, className = "w-[18px] h-[18px]" }: { name: string; classNa
     hidden: <><path d="M4.2 12.8c2.4 2.3 5 3.4 7.8 3.4s5.4-1.1 7.8-3.4" /><path d="M12 16.6v2.6M7.2 15.5l-1.5 2.2M16.8 15.5l1.5 2.2" /></>,
     lock: <><rect x="5.8" y="11" width="12.4" height="8.6" rx="2" /><path d="M8.7 11V8.2a3.3 3.3 0 0 1 6.6 0V11" /></>,
     menu: <path d="M4.5 7.2h15M4.5 12h15M4.5 16.8h15" />,
+    search: <><circle cx="11" cy="11" r="6.6" /><path d="m15.9 15.9 4.1 4.1" /></>,
+    grid: <><rect x="4" y="4" width="6.8" height="6.8" rx="1.8" /><rect x="13.2" y="4" width="6.8" height="6.8" rx="1.8" /><rect x="4" y="13.2" width="6.8" height="6.8" rx="1.8" /><rect x="13.2" y="13.2" width="6.8" height="6.8" rx="1.8" /></>,
   };
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.9}
@@ -302,14 +305,10 @@ export default function App() {
         </div>
 
         <SideItem icon="home" active={route.kind === "home"} onClick={() => go({ kind: "home" })}>Home</SideItem>
-        <SideItem icon="feed" active={route.kind === "feed"} onClick={() => go({ kind: "feed" })}>Feed</SideItem>
+        <SideItem icon="grid" active={["videos", "recent", "watched", "favorites", "categories", "category"].includes(route.kind)}
+          onClick={() => go({ kind: "videos" })}>Videos</SideItem>
         <SideItem icon="people" active={route.kind === "library" || route.kind === "model"} onClick={() => go({ kind: "library" })}>People</SideItem>
-
-        <SideLabel>Browse</SideLabel>
-        <SideItem icon="heart" active={route.kind === "favorites"} onClick={() => go({ kind: "favorites" })}>Favorites</SideItem>
-        <SideItem icon="tag" active={route.kind === "categories" || route.kind === "category"} onClick={() => go({ kind: "categories" })}>Tags</SideItem>
-        <SideItem icon="clock" active={route.kind === "watched"} onClick={() => go({ kind: "watched" })}>History</SideItem>
-        <SideItem icon="plus" active={route.kind === "recent"} onClick={() => go({ kind: "recent" })}>Latest</SideItem>
+        <SideItem icon="feed" active={route.kind === "feed"} onClick={() => go({ kind: "feed" })}>Feed</SideItem>
 
         <div className="flex items-center justify-between px-5 pt-4 pb-1">
           <span className="text-[11px] uppercase tracking-wider text-muted/70">Collections</span>
@@ -339,18 +338,17 @@ export default function App() {
       </nav>
 
       <main className="flex-1 min-w-0 overflow-y-auto pb-24 md:pb-0">
-        <div className="md:hidden sticky top-0 z-20 glass border-b border-edge/70"
-          style={{ paddingTop: "env(safe-area-inset-top)" }}>
-          <div className="flex items-center gap-3 px-4 py-3">
-            <button onClick={() => setNavOpen(true)} aria-label="Open menu"
-              className="w-10 h-10 -ml-1.5 grid place-items-center rounded-full text-fg text-2xl leading-none active:bg-panel2">≡</button>
-            <span className="flex items-center gap-2 text-base font-extrabold tracking-tight text-fg">
-              <Swirl className="w-6 h-6" />Keepsake
-            </span>
+        {route.kind !== "feed" && <TopBar search={search} onSearch={setSearch} onMenu={() => setNavOpen(true)} />}
+        <div key={search.trim() ? "search" : routeKey} className="rise">
+        {search.trim() ? (
+          <div className="p-4 md:p-6">
+            <SearchResultsPage q={search.trim()} results={searchResults} models={models} allLabels={allLabels}
+              collections={collections} modelNames={modelNames} onPlay={play}
+              onOpenModel={(name) => go({ kind: "model", name })} onOpenTag={(label) => go({ kind: "category", label })}
+              onOpenCollection={openCollection} onChanged={reload} />
           </div>
-        </div>
-        <div key={routeKey} className="rise">
-        {route.kind === "home" ? <Home onPlay={play} onOpenModel={(name) => go({ kind: "model", name })} onGo={go} version={version} />
+        ) : route.kind === "home" ? <Home onPlay={play} onOpenModel={(name) => go({ kind: "model", name })} onGo={go} version={version} />
+          : route.kind === "videos" ? <VideosPage version={version} modelNames={modelNames} collections={collections} onPlay={play} onChanged={reload} onOpenTags={() => go({ kind: "categories" })} />
           : route.kind === "feed" ? <Feed onOpenModel={(name) => go({ kind: "model", name })} onClose={() => go({ kind: "home" })} collections={collections} allLabels={allLabels} onChanged={reload} />
           : route.kind === "downloads" ? <Downloads queue={queue} />
           : route.kind === "settings" ? <SettingsPage />
@@ -359,10 +357,12 @@ export default function App() {
             <div className="p-4 md:p-6">
               <div className="flex items-center flex-wrap gap-3 md:gap-4 mb-5">
                 {route.kind === "model" && <button onClick={() => go({ kind: "library" })} className="text-muted hover:text-fg text-sm">← People</button>}
-                {route.kind === "category" && <button onClick={() => go({ kind: "categories" })} className="text-muted hover:text-fg text-sm">← Tags</button>}
+                {["category", "categories", "recent", "watched", "favorites"].includes(route.kind) && (
+                  <button onClick={() => go(route.kind === "category" ? { kind: "categories" } : { kind: "videos" })}
+                    className="text-muted hover:text-fg text-sm">← {route.kind === "category" ? "Tags" : "Videos"}</button>
+                )}
                 <h1 className="text-xl font-bold flex items-center gap-2">
-                  {searchResults !== null ? "Search"
-                    : route.kind === "model" ? null
+                  {route.kind === "model" ? null
                     : route.kind === "recent" ? "Latest"
                     : route.kind === "watched" ? "History"
                     : route.kind === "favorites" ? "Favorites"
@@ -371,23 +371,19 @@ export default function App() {
                     : route.kind === "collection" ? null
                     : "People"}
                 </h1>
-                {searchResults === null && ["recent", "watched", "favorites", "category"].includes(route.kind) && videos.length > 0 && (
+                {["recent", "watched", "favorites", "category"].includes(route.kind) && videos.length > 0 && (
                   <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-accent/15 text-accent">{videos.length}</span>
                 )}
-                {route.kind === "library" && searchResults === null && (
+                {route.kind === "library" && (
                   <div className="flex rounded-lg overflow-hidden border border-edge text-xs">
                     <FilterBtn on={siteFilter === "all"} onClick={() => setSiteFilter("all")}>All</FilterBtn>
                     <FilterBtn on={siteFilter === "PornHub"} onClick={() => setSiteFilter("PornHub")}>Pornhub</FilterBtn>
                     <FilterBtn on={siteFilter === "Twitter"} onClick={() => setSiteFilter("Twitter")}>X</FilterBtn>
                   </div>
                 )}
-                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search…"
-                  className="ml-auto w-full sm:w-64 bg-panel border border-edge rounded-lg px-4 py-2 text-sm outline-none focus:border-accent" />
               </div>
 
-              {searchResults !== null
-                ? <VideoArea videos={searchResults} modelNames={modelNames} onPlay={play} onChanged={reload} />
-                : route.kind === "library"
+              {route.kind === "library"
                   ? <ModelGrid models={models.filter((m) => siteFilter === "all" || (m.sites || "").includes(siteFilter))}
                       onOpen={(m) => go({ kind: "model", name: m.name })} onChanged={reload} />
                   : route.kind === "model"
@@ -466,6 +462,215 @@ function SideItem({ icon, iconColor, active, onClick, children }: any) {
 function FilterBtn({ on, onClick, children }: any) {
   return <button onClick={onClick} style={on ? { background: "var(--ac)", color: "var(--ac-ink)" } : undefined}
     className={`px-3 py-1.5 ${on ? "font-semibold" : "bg-panel text-muted hover:text-fg"}`}>{children}</button>;
+}
+
+/* ---------------- Top bar (search from anywhere) ---------------- */
+
+function TopBar({ search, onSearch, onMenu }: { search: string; onSearch: (q: string) => void; onMenu: () => void }) {
+  return (
+    <div className="sticky top-0 z-20 glass border-b border-edge/70" style={{ paddingTop: "env(safe-area-inset-top)" }}>
+      <div className="flex items-center gap-2 px-3 md:px-6 py-2.5">
+        <button onClick={onMenu} aria-label="Open menu"
+          className="md:hidden w-10 h-10 shrink-0 grid place-items-center rounded-full text-fg text-2xl leading-none active:bg-panel2">≡</button>
+        <Swirl className="md:hidden w-6 h-6 shrink-0" />
+        <div className="relative flex-1 max-w-2xl mx-auto">
+          <Icon name="search" className="w-[18px] h-[18px] absolute left-3.5 top-1/2 -translate-y-1/2 text-muted pointer-events-none" />
+          <input value={search} onChange={(e) => onSearch(e.target.value)} enterKeyHint="search"
+            placeholder="Search videos, people, tags, collections…"
+            className="w-full bg-panel border border-edge rounded-full pl-10 pr-10 py-2.5 text-sm outline-none focus:border-accent" />
+          {search && (
+            <button onClick={() => onSearch("")} aria-label="Clear search"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 w-8 h-8 grid place-items-center rounded-full text-muted hover:text-fg hover:bg-panel2">✕</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Search results (people + tags + collections + videos) ---------------- */
+
+function SearchResultsPage({ q, results, models, allLabels, collections, modelNames, onPlay, onOpenModel, onOpenTag, onOpenCollection, onChanged }:
+  { q: string; results: Video[] | null; models: Model[]; allLabels: string[]; collections: Collection[]; modelNames: string[];
+    onPlay: (v: Video, list?: Video[]) => void; onOpenModel: (name: string) => void; onOpenTag: (label: string) => void;
+    onOpenCollection: (c: Collection) => void; onChanged: () => void }) {
+  const ql = q.toLowerCase();
+  const people = models.filter((m) => m.name && m.name.toLowerCase().includes(ql)).slice(0, 24);
+  const tags = allLabels.filter((l) => l.toLowerCase().includes(ql)).slice(0, 20);
+  const colls = collections.filter((c) => c.name.toLowerCase().includes(ql));
+  const empty = results !== null && !results.length && !people.length && !tags.length && !colls.length;
+
+  if (empty) return <Empty icon="🔍">Nothing matches “{q}” — try a person's name, a tag, or a word from the title.</Empty>;
+  return (
+    <>
+      <h1 className="text-xl font-bold mb-5">Results for “{q}”</h1>
+
+      {people.length > 0 && (
+        <section className="mb-6">
+          <h2 className="text-[13px] font-bold text-muted mb-2.5">People</h2>
+          <div className="row flex gap-4 overflow-x-auto pb-2">
+            {people.map((p) => (
+              <button key={p.name} onClick={() => onOpenModel(p.name)} className="shrink-0 w-[92px] text-center">
+                <div className="avatar w-[84px] h-[84px] mx-auto">
+                  {p.thumbnail
+                    ? <img src={mediaURL(p.thumbnail)} loading="lazy" className="w-full h-full object-cover" />
+                    : <div className="w-full h-full grid place-items-center text-2xl text-muted">{(p.name[0] || "?").toUpperCase()}</div>}
+                </div>
+                <div className="text-xs font-semibold mt-2 truncate">{p.name}</div>
+                <div className="text-[11px] text-muted">{p.count} video{p.count === 1 ? "" : "s"}</div>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {(tags.length > 0 || colls.length > 0) && (
+        <section className="mb-6">
+          <div className="flex flex-wrap gap-2">
+            {tags.map((l) => (
+              <button key={"t" + l} onClick={() => onOpenTag(l)}
+                className="flex items-center gap-1.5 bg-panel border border-edge rounded-full px-3.5 py-1.5 text-sm hover:border-accent transition">
+                <Icon name="tag" className="w-4 h-4 text-accent" />{l}
+              </button>
+            ))}
+            {colls.map((c) => (
+              <button key={"c" + c.id} onClick={() => onOpenCollection(c)}
+                className="flex items-center gap-1.5 bg-panel border border-edge rounded-full px-3.5 py-1.5 text-sm hover:border-accent transition">
+                <Icon name={c.hidden ? "hidden" : "folder"} className="w-4 h-4 text-accent" />{c.name}
+                <span className="text-muted text-xs">{c.count}</span>
+                {c.locked && <Icon name="lock" className="w-3.5 h-3.5 text-muted" />}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {results === null
+        ? <CardGridSkeleton />
+        : results.length > 0 && (
+          <section>
+            <h2 className="text-[13px] font-bold text-muted mb-2.5">Videos <span className="text-muted/60 font-semibold text-[11px]">{results.length}</span></h2>
+            <VideoArea videos={results} modelNames={modelNames} onPlay={onPlay} onChanged={onChanged} />
+          </section>
+        )}
+    </>
+  );
+}
+
+/* ---------------- Videos (browse-everything timeline) ---------------- */
+
+const VIDEOS_PAGE = 200;
+const VIDEO_SORTS = [
+  { key: "newest", label: "Newest first" },
+  { key: "oldest", label: "Oldest first" },
+  { key: "longest", label: "Longest" },
+  { key: "largest", label: "Largest file" },
+  { key: "title", label: "A – Z" },
+];
+
+// monthOf buckets an "added" stamp into a timeline section ("July 2026").
+function monthOf(added?: string) {
+  const t = added ? Date.parse(added.replace(" ", "T")) : NaN;
+  if (isNaN(t)) return "Earlier";
+  return new Date(t).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function VideosPage({ version, modelNames, collections, onPlay, onChanged, onOpenTags }:
+  { version: number; modelNames: string[]; collections: Collection[];
+    onPlay: (v: Video, list?: Video[]) => void; onChanged: () => void; onOpenTags: () => void }) {
+  const [vids, setVids] = useState<Video[]>([]);
+  const [sort, setSort] = useState(localStorage.videoSort || "newest");
+  const [site, setSite] = useState("");
+  const [fav, setFav] = useState(false);
+  const [done, setDone] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const busy = useRef(false);
+  const sentinel = useRef<HTMLDivElement>(null);
+
+  const pickSort = (s: string) => { setSort(s); localStorage.videoSort = s; };
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setDone(false);
+    AllVideos(VIDEOS_PAGE, 0, sort, site, fav).then((v) => {
+      if (!alive) return;
+      setVids(v || []);
+      setDone(!v || v.length < VIDEOS_PAGE);
+      setLoading(false);
+    });
+    return () => { alive = false; };
+  }, [sort, site, fav, version]);
+
+  const more = useCallback(async () => {
+    if (busy.current || done || loading) return;
+    busy.current = true;
+    try {
+      const v = await AllVideos(VIDEOS_PAGE, vids.length, sort, site, fav);
+      setVids((cur) => [...cur, ...(v || [])]);
+      if (!v || v.length < VIDEOS_PAGE) setDone(true);
+    } finally { busy.current = false; }
+  }, [vids.length, sort, site, fav, done, loading]);
+
+  // Infinite scroll: fetch the next page when the sentinel nears the viewport.
+  useEffect(() => {
+    const el = sentinel.current;
+    if (!el) return;
+    const io = new IntersectionObserver((es) => { if (es[0].isIntersecting) more(); }, { rootMargin: "800px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [more]);
+
+  // Month sections only make sense for date order; other sorts get a flat grid.
+  const groups = useMemo(() => {
+    if (sort !== "newest" && sort !== "oldest") return undefined;
+    const out: { title: string; videos: Video[] }[] = [];
+    for (const v of vids) {
+      const t = monthOf(v.added);
+      if (!out.length || out[out.length - 1].title !== t) out.push({ title: t, videos: [] });
+      out[out.length - 1].videos.push(v);
+    }
+    return out;
+  }, [vids, sort]);
+
+  return (
+    <div className="p-4 md:p-6">
+      <div className="flex items-center flex-wrap gap-2.5 mb-4">
+        <h1 className="text-xl font-bold mr-1">Videos</h1>
+        <div className="flex rounded-lg overflow-hidden border border-edge text-xs">
+          <FilterBtn on={site === ""} onClick={() => setSite("")}>All</FilterBtn>
+          <FilterBtn on={site === "PornHub"} onClick={() => setSite("PornHub")}>Pornhub</FilterBtn>
+          <FilterBtn on={site === "Twitter"} onClick={() => setSite("Twitter")}>X</FilterBtn>
+        </div>
+        <button onClick={() => setFav(!fav)}
+          className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition ${fav ? "border-transparent" : "bg-panel border-edge text-muted hover:text-fg"}`}
+          style={fav ? { background: "var(--ac)", color: "var(--ac-ink)" } : undefined}>❤ Favorites</button>
+        <button onClick={onOpenTags} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-panel border border-edge text-muted hover:text-fg">
+          # Tags
+        </button>
+        <select value={sort} onChange={(e) => pickSort(e.target.value)} aria-label="Sort"
+          className="ml-auto bg-panel border border-edge rounded-lg px-2.5 py-1.5 text-xs text-fg outline-none focus:border-accent">
+          {VIDEO_SORTS.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+        </select>
+      </div>
+
+      {loading
+        ? <CardGridSkeleton />
+        : vids.length === 0
+          ? <Empty icon="🎬">{fav ? "No favorites match this filter yet — tap ❤ on a video you love." : "No videos here yet — add a download or import your files."}</Empty>
+          : (
+            <>
+              <VideoArea videos={vids} groups={groups} modelNames={modelNames} collections={collections} onPlay={onPlay} onChanged={onChanged} />
+              {!done && (
+                <div className="mt-6 text-center">
+                  <div ref={sentinel} className="h-2" />
+                  <button onClick={more} className="text-sm font-medium px-5 py-2 rounded-full bg-panel2 hover:bg-edge text-fg border border-edge">Load more</button>
+                </div>
+              )}
+            </>
+          )}
+    </div>
+  );
 }
 
 /* ---------------- Home (discovery wall) ---------------- */
@@ -1099,8 +1304,9 @@ function Lightbox({ photos, index, onIndex, onClose, onSetCover }:
 
 /* ---------------- Video area (grid + bulk select) ---------------- */
 
-function VideoArea({ videos, modelNames, collections, collectionId, onPlay, onChanged }:
-  { videos: Video[]; modelNames: string[]; collections?: Collection[]; collectionId?: number;
+function VideoArea({ videos, groups, modelNames, collections, collectionId, onPlay, onChanged }:
+  { videos: Video[]; groups?: { title: string; videos: Video[] }[]; modelNames: string[];
+    collections?: Collection[]; collectionId?: number;
     onPlay: (v: Video, list?: Video[]) => void; onChanged: () => void }) {
   const [selectMode, setSelectMode] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -1142,12 +1348,21 @@ function VideoArea({ videos, modelNames, collections, collectionId, onPlay, onCh
               <button onClick={exit} className="text-muted hover:text-fg text-xs">Cancel</button>
             </>}
       </div>
-      <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,290px),1fr))" }}>
-        {videos.map((v) => (
-          <VideoCard key={key(v)} v={v} selectMode={selectMode} selected={picked.has(key(v))}
-            onClick={() => (selectMode ? toggle(v) : onPlay(v, videos))} />
-        ))}
-      </div>
+      {(groups && groups.length ? groups : [{ title: "", videos }]).map((g, gi) => (
+        <section key={g.title || gi}>
+          {g.title && (
+            <h3 className="text-[13px] font-bold text-muted mt-6 mb-2.5 first:mt-0 flex items-baseline gap-2">
+              {g.title} <span className="text-[11px] font-semibold text-muted/60">{g.videos.length}</span>
+            </h3>
+          )}
+          <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,290px),1fr))" }}>
+            {g.videos.map((v) => (
+              <VideoCard key={key(v)} v={v} selectMode={selectMode} selected={picked.has(key(v))}
+                onClick={() => (selectMode ? toggle(v) : onPlay(v, videos))} />
+            ))}
+          </div>
+        </section>
+      ))}
       {moving && (
         <ModelsEditor refs={pickedVideos.map((v) => ({ site: v.site, id: v.id }))} modelNames={modelNames}
           onClose={() => setMoving(false)} onDone={() => { setMoving(false); exit(); onChanged(); }} />
@@ -2021,9 +2236,9 @@ function TabBar({ route, onGo, onMore, navOpen }:
   { route: Route; onGo: (r: Route) => void; onMore: () => void; navOpen: boolean }) {
   const tabs = [
     { key: "home", label: "Home", icon: "home", active: route.kind === "home", onClick: () => onGo({ kind: "home" }) },
-    { key: "feed", label: "Feed", icon: "feed", active: route.kind === "feed", onClick: () => onGo({ kind: "feed" }) },
+    { key: "videos", label: "Videos", icon: "grid", active: ["videos", "recent", "watched", "favorites", "categories", "category"].includes(route.kind), onClick: () => onGo({ kind: "videos" }) },
     { key: "library", label: "People", icon: "people", active: route.kind === "library" || route.kind === "model", onClick: () => onGo({ kind: "library" }) },
-    { key: "favorites", label: "Favorites", icon: "heart", active: route.kind === "favorites", onClick: () => onGo({ kind: "favorites" }) },
+    { key: "feed", label: "Feed", icon: "feed", active: route.kind === "feed", onClick: () => onGo({ kind: "feed" }) },
     { key: "more", label: "More", icon: "menu", active: navOpen, onClick: onMore },
   ];
   return (

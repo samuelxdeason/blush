@@ -790,15 +790,40 @@ func (db *DB) RecentlyDownloaded(limit int) ([]Video, error) {
 	return db.query(`WHERE `+notHidden+` ORDER BY added DESC LIMIT ?`, limit)
 }
 
+// AllVideos returns one page of the whole (non-hidden) library for the
+// browse-everything timeline. sort picks the order; site/favOnly narrow it.
+func (db *DB) AllVideos(limit, offset int, sort, site string, favOnly bool) ([]Video, error) {
+	order := map[string]string{
+		"newest":  "added DESC, id",
+		"oldest":  "added ASC, id",
+		"longest": "COALESCE(duration,0) DESC, added DESC",
+		"largest": "COALESCE(filesize,0) DESC, added DESC",
+		"title":   "LOWER(COALESCE(NULLIF(title,''),uploader)) ASC",
+	}[sort]
+	if order == "" {
+		order = "added DESC, id"
+	}
+	where, args := `WHERE `+notHidden, []any{}
+	if site != "" {
+		where += ` AND site=?`
+		args = append(args, site)
+	}
+	if favOnly {
+		where += ` AND favorite=1`
+	}
+	args = append(args, limit, offset)
+	return db.query(where+` ORDER BY `+order+` LIMIT ? OFFSET ?`, args...)
+}
+
 // RecentlyWatched returns videos most recently opened in the player.
 func (db *DB) RecentlyWatched(limit int) ([]Video, error) {
 	return db.query(`WHERE watched_at IS NOT NULL AND watched_at<>'' AND `+notHidden+` ORDER BY watched_at DESC LIMIT ?`, limit)
 }
 
-// Search returns videos whose title, model, or uploader matches (blank = all).
+// Search returns videos whose title, model, uploader, or tag matches (blank = all).
 func (db *DB) Search(q string) ([]Video, error) {
 	like := "%" + q + "%"
-	return db.query(`WHERE (title LIKE ? OR model LIKE ? OR uploader LIKE ?) AND `+notHidden+` ORDER BY added DESC LIMIT 500`, like, like, like)
+	return db.query(`WHERE (title LIKE ? OR model LIKE ? OR uploader LIKE ? OR labels LIKE ?) AND `+notHidden+` ORDER BY added DESC LIMIT 500`, like, like, like, like)
 }
 
 // MigrateFromJSON imports a legacy library.json file, returning rows imported.

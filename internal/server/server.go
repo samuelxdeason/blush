@@ -69,6 +69,13 @@ func (s *Server) routes(ui fs.FS) {
 	m.HandleFunc("GET /api/collections", j(func(_ *http.Request) (any, error) { return s.core.Collections() }))
 	m.HandleFunc("GET /api/queue", j(func(_ *http.Request) (any, error) { return s.core.Queue(), nil }))
 
+	m.HandleFunc("GET /api/videos", j(func(r *http.Request) (any, error) {
+		limit := int(qInt(r, "limit"))
+		if limit <= 0 || limit > 500 {
+			limit = 200
+		}
+		return s.core.AllVideos(limit, int(qInt(r, "offset")), q(r, "sort"), q(r, "site"), q(r, "fav") == "1")
+	}))
 	m.HandleFunc("GET /api/videos/by-model", j(func(r *http.Request) (any, error) { return s.core.VideosByModel(q(r, "model")) }))
 	m.HandleFunc("GET /api/videos/by-site", j(func(r *http.Request) (any, error) { return s.core.VideosBySite(q(r, "site")) }))
 	m.HandleFunc("GET /api/videos/by-label", j(func(r *http.Request) (any, error) { return s.core.VideosByLabel(q(r, "label")) }))

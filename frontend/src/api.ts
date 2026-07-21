@@ -52,6 +52,10 @@ export const MediaRootPath = () => getJSON<string>("/api/mediaroot");
 export const Collections = () => getJSON<library.Collection[]>("/api/collections");
 export const Queue = () => getJSON<downloader.Job[]>("/api/queue");
 
+// AllVideos pages through the whole library (the browse-everything timeline).
+// sort: newest | oldest | longest | largest | title. site/fav narrow the set.
+export const AllVideos = (limit: number, offset: number, sort: string, site: string, fav: boolean) =>
+  getJSON<Video[]>("/api/videos" + qs({ limit, offset, sort, site, fav: fav ? 1 : 0 }));
 export const VideosByModel = (model: string) => getJSON<Video[]>("/api/videos/by-model" + qs({ model }));
 export const VideosByLabel = (label: string) => getJSON<Video[]>("/api/videos/by-label" + qs({ label }));
 export const VideosByCollection = (id: number) => getJSON<Video[]>("/api/videos/by-collection" + qs({ id }));

@@ -95,6 +95,9 @@ func (c *Core) Models() ([]library.Model, error)                    { return c.d
 func (c *Core) VideosByModel(model string) ([]library.Video, error) { return c.db.VideosByModel(model) }
 func (c *Core) VideosBySite(site string) ([]library.Video, error)   { return c.db.VideosBySite(site) }
 func (c *Core) Search(q string) ([]library.Video, error)            { return c.db.Search(q) }
+func (c *Core) AllVideos(limit, offset int, sort, site string, fav bool) ([]library.Video, error) {
+	return c.db.AllVideos(limit, offset, sort, site, fav)
+}
 func (c *Core) RecentlyDownloaded() ([]library.Video, error)        { return c.db.RecentlyDownloaded(200) }
 func (c *Core) RecentlyWatched() ([]library.Video, error)           { return c.db.RecentlyWatched(200) }
 func (c *Core) Favorites() ([]library.Video, error)                 { return c.db.Favorites() }
