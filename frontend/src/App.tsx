@@ -301,7 +301,7 @@ export default function App() {
         style={{ paddingTop: "env(safe-area-inset-top)" }}>
         <div className="px-5 py-6 flex items-center gap-2.5">
           <Swirl className="w-7 h-7 shrink-0" />
-          <span className="text-lg font-extrabold tracking-tight text-fg">Keepsake</span>
+          <span className="text-lg font-extrabold tracking-tight text-fg">nudes<span className="text-accent">.xxx</span></span>
         </div>
 
         <SideItem icon="home" active={route.kind === "home"} onClick={() => go({ kind: "home" })}>Home</SideItem>
@@ -1707,7 +1707,7 @@ function BrowseSync({ onEnqueued }: { onEnqueued: () => void }) {
       {/* Saved syncs */}
       {!showList && (
         lists.length === 0
-          ? <Empty icon="✨" action={{ label: "+ Follow someone", onClick: () => setAdding(true) }}>You're not following anything yet. Add a person, channel, or your favorites and Keepsake will keep track of what's new.</Empty>
+          ? <Empty icon="✨" action={{ label: "+ Follow someone", onClick: () => setAdding(true) }}>You're not following anything yet. Add a person, channel, or your favorites and nudes.xxx will keep track of what's new.</Empty>
           : (
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(240px,1fr))" }}>
               {lists.map((l) => (

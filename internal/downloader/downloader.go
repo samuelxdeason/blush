@@ -183,7 +183,7 @@ func (d *Downloader) Enumerate(listURL string, refresh bool) ([]RemoteItem, erro
 		}
 	}
 
-	args := []string{"--ignore-config", "--flat-playlist", "--no-warnings",
+	args := []string{"--ignore-config", "--encoding", "utf-8", "--flat-playlist", "--no-warnings",
 		"--print", "%(url)s %(title)s"}
 	args = append(args, d.cookieArgs()...)
 	args = append(args, listURL)
@@ -538,12 +538,20 @@ func (d *Downloader) run(j *Job) {
 	d.mu.Unlock()
 	d.emitQueue()
 
-	outtmpl := filepath.Join(cfg.MediaRoot,
-		"%(extractor_key)s", "%(uploader,uploader_id)s",
-		"%(uploader,uploader_id)s [%(id)s].%(ext)s")
+	// Flat layout: files land directly in media/ named by source+id (pure
+	// machine identity — models/titles live only in the catalogue). ingest
+	// canonicalises the name and parks the sidecars under .keepsake after
+	// the download finishes.
+	outtmpl := filepath.Join(cfg.MediaRoot, library.MediaDirName,
+		"%(extractor_key)s-%(id)s.%(ext)s")
 
 	args := []string{
 		"--ignore-config",
+		// The PyInstaller-frozen yt-dlp.exe ignores PYTHONUTF8/PYTHONIOENCODING,
+		// so piped output falls back to the ANSI code page and silently drops
+		// emoji/non-Latin chars from printed paths — breaking ingest. --encoding
+		// is honored by the frozen exe and keeps [[DONE]] paths byte-accurate.
+		"--encoding", "utf-8",
 		"-f", "bestvideo+bestaudio/best",
 		"--merge-output-format", "mp4",
 		"--postprocessor-args", "Merger:-movflags +faststart", // moov at front → instant seek
@@ -755,11 +763,54 @@ type ytInfo struct {
 	Description  string   `json:"description"`
 }
 
-// ingest reads the sidecar metadata for a downloaded file and stores it.
+// ---- flat layout paths ---------------------------------------------------
+
+func (d *Downloader) mediaDir() string {
+	return filepath.Join(d.cfg.MediaRoot, library.MediaDirName)
+}
+
+func (d *Downloader) stateDirOrDefault() string {
+	if d.cfg.StateDir != "" {
+		return d.cfg.StateDir
+	}
+	return filepath.Join(d.cfg.MediaRoot, stateDirBase)
+}
+
+func (d *Downloader) metaDir() string {
+	return filepath.Join(d.stateDirOrDefault(), library.MetaDirName)
+}
+
+func (d *Downloader) thumbsDir() string {
+	return filepath.Join(d.stateDirOrDefault(), library.ThumbsDirName)
+}
+
+// inMediaDir reports whether p sits inside the flat media/ folder (as opposed
+// to the legacy <Site>/<Uploader>/ tree).
+func (d *Downloader) inMediaDir(p string) bool {
+	rel, err := filepath.Rel(d.mediaDir(), p)
+	return err == nil && rel != "." && !strings.HasPrefix(rel, "..")
+}
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// ingest reads the sidecar metadata for a downloaded file and stores it. The
+// sidecar sits beside the file (fresh download, legacy tree) or under
+// .keepsake/meta (flat layout).
 func (d *Downloader) ingest(filepathStr string) (library.Video, bool) {
 	stem := strings.TrimSuffix(filepathStr, filepath.Ext(filepathStr))
+	sidecar := stem + ".info.json"
+	if !fileExists(sidecar) && d.inMediaDir(filepathStr) {
+		if alt := filepath.Join(d.metaDir(), filepath.Base(stem)+".info.json"); fileExists(alt) {
+			sidecar = alt
+		}
+	}
+	return d.ingestFrom(filepathStr, sidecar)
+}
+
+// ingestFrom catalogues a media file using an explicit sidecar path.
+func (d *Downloader) ingestFrom(filepathStr, sidecar string) (library.Video, bool) {
 	info := ytInfo{}
-	if data, err := os.ReadFile(stem + ".info.json"); err == nil {
+	if data, err := os.ReadFile(sidecar); err == nil {
 		_ = json.Unmarshal(data, &info)
 	}
 	if info.ID == "" {
@@ -773,9 +824,15 @@ func (d *Downloader) ingest(filepathStr string) (library.Video, bool) {
 	if info.ExtractorKey != "Twitter" && uploader != "" {
 		models = []string{uploader}
 	}
-	thumb := findThumb(stem)
-	if thumb == "" {
-		thumb = d.makeThumb(filepathStr, stem, info.Duration) // ffmpeg fallback
+	var thumb string
+	if d.inMediaDir(filepathStr) {
+		filepathStr, thumb = d.canonicalizeFlat(filepathStr, sidecar, info)
+	} else {
+		stem := strings.TrimSuffix(filepathStr, filepath.Ext(filepathStr))
+		thumb = findThumb(stem)
+		if thumb == "" {
+			thumb = d.makeThumb(filepathStr, stem, info.Duration) // ffmpeg fallback
+		}
 	}
 	v := library.Video{
 		ID:           info.ID,
@@ -811,6 +868,54 @@ func (d *Downloader) ingest(filepathStr string) (library.Video, bool) {
 		return library.Video{}, false
 	}
 	return v, true
+}
+
+// canonicalizeFlat finalises a file living in media/: renames it to the
+// canonical "<site>-<id>.<ext>" (yt-dlp's own naming can differ in case or
+// sanitisation), moves the .info.json to .keepsake/meta and the thumbnail to
+// .keepsake/thumbs, and returns the final video + thumbnail paths.
+func (d *Downloader) canonicalizeFlat(fp, sidecar string, info ytInfo) (video, thumb string) {
+	origStem := strings.TrimSuffix(fp, filepath.Ext(fp))
+	ext := strings.ToLower(filepath.Ext(fp))
+	base := library.FlatBase(info.ExtractorKey, info.ID)
+
+	if want := filepath.Join(d.mediaDir(), base+ext); !strings.EqualFold(fp, want) {
+		if !fileExists(want) && os.Rename(fp, want) == nil {
+			fp = want
+		}
+	}
+
+	if fileExists(sidecar) {
+		want := filepath.Join(d.metaDir(), base+".info.json")
+		if !strings.EqualFold(sidecar, want) {
+			_ = os.MkdirAll(d.metaDir(), 0o755)
+			if fileExists(want) {
+				_ = os.Remove(sidecar) // same sidecar written twice; keep the parked copy
+			} else {
+				_ = os.Rename(sidecar, want)
+			}
+		}
+	}
+
+	_ = os.MkdirAll(d.thumbsDir(), 0o755)
+	for _, e := range []string{".jpg", ".jpeg", ".webp", ".png"} {
+		src := origStem + e
+		dst := filepath.Join(d.thumbsDir(), base+e)
+		if fileExists(src) && !strings.EqualFold(src, dst) {
+			if fileExists(dst) {
+				_ = os.Remove(src)
+			} else {
+				_ = os.Rename(src, dst)
+			}
+		}
+		if thumb == "" && fileExists(dst) {
+			thumb = dst
+		}
+	}
+	if thumb == "" {
+		thumb = d.makeThumb(fp, filepath.Join(d.thumbsDir(), base), info.Duration)
+	}
+	return fp, thumb
 }
 
 func findThumb(stem string) string {
@@ -1009,28 +1114,41 @@ func (d *Downloader) importWork(paths []string, model string) {
 	d.emit("import", map[string]any{"done": total, "total": total, "added": added, "finished": true})
 }
 
+// localIdentity derives a stable catalogue id for an imported file. It hashes
+// the LEGACY Local/<model>/<file> path the file would have had before the flat
+// layout, so re-imports — and rows created before the migration — land on the
+// same row and keep the user's edits.
+func (d *Downloader) localIdentity(prefix, subdir, folder, base string) string {
+	parts := []string{d.cfg.MediaRoot, "Local", sanitizeName(folder)}
+	if subdir != "" {
+		parts = append(parts, subdir)
+	}
+	parts = append(parts, base)
+	return prefix + hashStr(filepath.Join(parts...))
+}
+
 func (d *Downloader) importPhotoOne(src, model string) bool {
 	base := filepath.Base(src)
 	folder := model
 	if strings.TrimSpace(folder) == "" {
 		folder = "Unassigned"
 	}
-	destDir := filepath.Join(d.cfg.MediaRoot, "Local", sanitizeName(folder), "photos")
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return false
-	}
-	dest := filepath.Join(destDir, base)
-	if !strings.EqualFold(src, dest) {
-		if _, err := os.Stat(dest); err != nil {
+	id := d.localIdentity("photo_", "photos", folder, base)
+	dest := filepath.Join(d.mediaDir(), library.FlatBase("photo", id)+strings.ToLower(filepath.Ext(base)))
+	if strings.EqualFold(src, dest) {
+		dest = src
+	} else {
+		if err := os.MkdirAll(d.mediaDir(), 0o755); err != nil {
+			return false
+		}
+		if !fileExists(dest) {
 			if copyFile(src, dest) != nil {
 				return false
 			}
 		}
-	} else {
-		dest = src
 	}
 	return d.db.AddPhoto(library.Photo{
-		ID:       "photo_" + hashStr(dest),
+		ID:       id,
 		Model:    model,
 		Filepath: dest,
 		Filename: base,
@@ -1044,32 +1162,36 @@ func (d *Downloader) importOne(src, model string) bool {
 	if strings.TrimSpace(folder) == "" {
 		folder = "Unassigned"
 	}
-	destDir := filepath.Join(d.cfg.MediaRoot, "Local", sanitizeName(folder))
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return false
-	}
-	dest := filepath.Join(destDir, base)
-	if !strings.EqualFold(src, dest) {
-		if _, err := os.Stat(dest); err != nil { // don't recopy if already there
+	id := d.localIdentity("local_", "", folder, base)
+	flatBase := library.FlatBase("Local", id)
+	dest := filepath.Join(d.mediaDir(), flatBase+strings.ToLower(filepath.Ext(base)))
+	if strings.EqualFold(src, dest) {
+		dest = src
+	} else {
+		if err := os.MkdirAll(d.mediaDir(), 0o755); err != nil {
+			return false
+		}
+		if !fileExists(dest) { // don't recopy if already there
 			if copyFile(src, dest) != nil {
 				return false
 			}
 		}
-	} else {
-		dest = src
 	}
 
 	dur, w, h := d.ffprobeInfo(dest)
-	stem := strings.TrimSuffix(dest, filepath.Ext(dest))
-	thumb := findThumb(stem)
+	_ = os.MkdirAll(d.thumbsDir(), 0o755)
+	thumbStem := filepath.Join(d.thumbsDir(), flatBase)
+	thumb := findThumb(thumbStem)
 	if thumb == "" {
 		var df *float64
 		if dur != nil {
 			f := float64(*dur)
 			df = &f
 		}
-		thumb = d.makeThumb(dest, stem, df)
+		thumb = d.makeThumb(dest, thumbStem, df)
 	}
+	// Synthetic sidecar so RebuildFromDisk can restore this row from disk alone.
+	d.writeLocalSidecar(flatBase, id, cleanTitle(base), model, dur, w, h)
 	var size *int64
 	if st, err := os.Stat(dest); err == nil {
 		s := st.Size()
@@ -1080,19 +1202,44 @@ func (d *Downloader) importOne(src, model string) bool {
 		models = []string{model}
 	}
 	v := library.Video{
-		ID:       "local_" + hashStr(dest),
+		ID:       id,
 		Site:     "Local",
 		Title:    cleanTitle(base),
 		Uploader: model,
 		Models:   models,
 		Duration: dur, Width: w, Height: h,
-		Ext:      strings.TrimPrefix(filepath.Ext(dest), "."),
-		Filepath: dest, Filename: base,
+		Ext:      strings.TrimPrefix(strings.ToLower(filepath.Ext(dest)), "."),
+		Filepath: dest, Filename: filepath.Base(dest),
 		Thumbnail: thumb,
 		Filesize:  size,
 		Added:     time.Now().Format("2006-01-02 15:04:05"),
 	}
 	return d.db.Upsert(v) == nil
+}
+
+// writeLocalSidecar writes a minimal .info.json for a local import, carrying
+// exactly the fields ingest reads, so a rebuild keeps the same id and model.
+func (d *Downloader) writeLocalSidecar(flatBase, id, title, uploader string, dur, w, h *int) {
+	if err := os.MkdirAll(d.metaDir(), 0o755); err != nil {
+		return
+	}
+	m := map[string]any{
+		"id":            id,
+		"extractor_key": "Local",
+		"title":         title,
+		"uploader":      uploader,
+	}
+	if dur != nil {
+		m["duration"] = *dur
+	}
+	if w != nil {
+		m["width"] = *w
+	}
+	if h != nil {
+		m["height"] = *h
+	}
+	b, _ := json.MarshalIndent(m, "", "  ")
+	_ = os.WriteFile(filepath.Join(d.metaDir(), flatBase+".info.json"), b, 0o644)
 }
 
 // ---- rebuild catalogue from disk --------------------------------------
@@ -1112,7 +1259,26 @@ func (d *Downloader) RebuildFromDisk() (int, error) {
 	n := 0
 	sep := string(filepath.Separator)
 
-	// 1) Downloads: ingest the media beside every .info.json sidecar.
+	// 0) Flat layout: sidecars live in .keepsake/meta, media in media/. This
+	// covers everything the flat migration (or a post-migration download or
+	// import) produced — including Local files via their synthetic sidecars.
+	if entries, err := os.ReadDir(d.metaDir()); err == nil {
+		const suffix = ".info.json"
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(name), suffix) {
+				continue
+			}
+			stem := filepath.Join(d.mediaDir(), name[:len(name)-len(suffix)])
+			if media := findMediaFile(stem); media != "" {
+				if _, ok := d.ingestFrom(media, filepath.Join(d.metaDir(), name)); ok {
+					n++
+				}
+			}
+		}
+	}
+
+	// 1) Legacy tree: ingest the media beside every .info.json sidecar.
 	_ = filepath.WalkDir(root, func(p string, e fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -1175,8 +1341,8 @@ func (d *Downloader) RebuildFromDisk() (int, error) {
 	return n, nil
 }
 
-// stateDirBase mirrors core's .keepsake folder name so a rebuild scan skips it.
-const stateDirBase = ".keepsake"
+// stateDirBase mirrors core's .xxx state folder name so a rebuild scan skips it.
+const stateDirBase = ".xxx"
 
 // findMediaFile returns the video file sharing stem (the part before .info.json).
 func findMediaFile(stem string) string {

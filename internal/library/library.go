@@ -198,7 +198,23 @@ func Open(path, root string) (*DB, error) {
 	db := &DB{sql: sqlDB, root: root}
 	db.relativize()           // convert any legacy absolute paths to relative (idempotent)
 	db.migrateModelsToArray() // single-value model -> JSON array (idempotent)
+	db.migrateStatePrefix()   // .keepsake\ paths -> .xxx\ after the state dir rename (idempotent)
 	return db, nil
+}
+
+// migrateStatePrefix rewrites stored paths that point into the old .keepsake
+// state folder after its rename to .xxx (thumbnails and model covers live
+// there; media paths never do). Idempotent: matches nothing once rewritten.
+func (db *DB) migrateStatePrefix() {
+	for _, sep := range []string{`\`, `/`} {
+		oldPrefix := ".keepsake" + sep
+		newPrefix := ".xxx" + sep
+		from := len(oldPrefix) + 1 // SQLite substr is 1-based
+		_, _ = db.sql.Exec(`UPDATE videos SET thumbnail = ? || substr(thumbnail, ?) WHERE thumbnail LIKE ?`,
+			newPrefix, from, oldPrefix+"%")
+		_, _ = db.sql.Exec(`UPDATE model_info SET cover = ? || substr(cover, ?) WHERE cover LIKE ?`,
+			newPrefix, from, oldPrefix+"%")
+	}
 }
 
 // migrateModelsToArray wraps any legacy plain-string model in a JSON array, so

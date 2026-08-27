@@ -224,7 +224,10 @@ func (c *Core) ImportUpload(filename, model string, r io.Reader) error {
 	if folder == "" {
 		folder = "Unassigned"
 	}
-	destDir := filepath.Join(c.mediaRoot, "Local", sanitize(folder), "uploads")
+	// Received uploads land in .keepsake (out of the media tree); Import then
+	// copies them to their flat media/ home. The original is kept, matching
+	// the old Local/<model>/uploads behavior, and rebuild scans ignore it.
+	destDir := filepath.Join(c.stateDir, "uploads", sanitize(folder))
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return err
 	}

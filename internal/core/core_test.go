@@ -50,3 +50,28 @@ func TestMigrateState(t *testing.T) {
 		t.Errorf("second run corrupted state: %q err=%v", got, err)
 	}
 }
+
+// TestMigrateStateRenamesLegacyDir: a .keepsake folder from the Keepsake era is
+// renamed wholesale to .xxx, contents intact.
+func TestMigrateStateRenamesLegacyDir(t *testing.T) {
+	root := t.TempDir()
+	old := filepath.Join(root, legacyStateDirName)
+	if err := os.MkdirAll(filepath.Join(old, "meta"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, "library.db"), []byte("db"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	migrateState(root)
+
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf(".keepsake should be gone after the rename, err=%v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(stateDir(root), "library.db")); err != nil || string(got) != "db" {
+		t.Errorf("db should have moved with the folder: %q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir(root), "meta")); err != nil {
+		t.Errorf("subfolders should move with the folder: %v", err)
+	}
+}

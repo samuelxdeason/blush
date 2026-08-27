@@ -247,7 +247,11 @@ const defaultRootName = "MediaVault"
 
 // stateDirName is the hidden subfolder holding app state (catalogue, archive,
 // cookies, caches) so the vault root contains only media folders.
-const stateDirName = ".keepsake"
+const stateDirName = ".xxx"
+
+// legacyStateDirName is the state folder's pre-rename name (Keepsake era);
+// migrateState renames it in place on first launch after the update.
+const legacyStateDirName = ".keepsake"
 
 func stateDir(mediaRoot string) string { return filepath.Join(mediaRoot, stateDirName) }
 
@@ -277,6 +281,14 @@ func resolveDBPath(mediaRoot, sdir string) (path string, freshInstall bool) {
 // db so SQLite can still recover an unflushed write-ahead log.
 func migrateState(mediaRoot string) {
 	dir := stateDir(mediaRoot)
+	// One-time: the whole state dir was renamed .keepsake -> .xxx with the app.
+	// Rename it wholesale (db, wal, archive, meta/, thumbs/ all come along);
+	// stored .keepsake\ paths are rewritten by library.Open.
+	if _, err := os.Stat(dir); err != nil {
+		if oldDir := filepath.Join(mediaRoot, legacyStateDirName); fileExists(oldDir) {
+			_ = os.Rename(oldDir, dir)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}

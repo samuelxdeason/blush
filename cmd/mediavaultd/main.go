@@ -17,6 +17,20 @@ import (
 )
 
 func main() {
+	// Subcommand: `mediavaultd migrate-flat` converts the vault to the flat
+	// media/ layout (dry run unless --apply). Stop the daemon before applying.
+	if len(os.Args) > 1 && os.Args[1] == "migrate-flat" {
+		fs := flag.NewFlagSet("migrate-flat", flag.ExitOnError)
+		root := fs.String("root", "", "media vault directory (else $MEDIAVAULT_ROOT, saved config, or a default under home)")
+		apply := fs.Bool("apply", false, "execute the migration (default is a dry run that only writes a manifest)")
+		rollback := fs.String("rollback", "", "journal file from a previous --apply to roll back")
+		_ = fs.Parse(os.Args[2:])
+		if err := core.RunFlatMigration(core.ResolveRoot(*root), *apply, *rollback); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	addr := flag.String("addr", ":8899", "listen address (e.g. 0.0.0.0:8899 to expose on the LAN). Avoid 8787 — Plex uses it.")
 	root := flag.String("root", "", "media vault directory (else $MEDIAVAULT_ROOT, saved config, or a default under home)")
 	uiDir := flag.String("ui", "frontend/dist", "directory of the built web UI to serve (empty to disable)")
@@ -48,7 +62,7 @@ func main() {
 	}
 
 	srv := server.New(c, hub, ui)
-	log.Printf("Keepsake daemon listening on %s  (vault: %s)", *addr, resolved)
+	log.Printf("nudes.xxx daemon listening on %s  (vault: %s)", *addr, resolved)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}
