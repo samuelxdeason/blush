@@ -108,6 +108,7 @@ export namespace library {
 	}
 	export class Model {
 	    name: string;
+	    nickname: string;
 	    count: number;
 	    totalSeconds: number;
 	    bytes: number;
@@ -121,6 +122,7 @@ export namespace library {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
+	        this.nickname = source["nickname"];
 	        this.count = source["count"];
 	        this.totalSeconds = source["totalSeconds"];
 	        this.bytes = source["bytes"];
@@ -144,6 +146,7 @@ export namespace library {
 	}
 	export class ModelInfo {
 	    name: string;
+	    nickname: string;
 	    bio: string;
 	    links: ModelLink[];
 	    cover: string;
@@ -155,6 +158,7 @@ export namespace library {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
+	        this.nickname = source["nickname"];
 	        this.bio = source["bio"];
 	        this.links = this.convertValues(source["links"], ModelLink);
 	        this.cover = source["cover"];
@@ -182,6 +186,7 @@ export namespace library {
 	export class Photo {
 	    id: string;
 	    model: string;
+	    album: string;
 	    filepath: string;
 	    filename: string;
 	    added: string;
@@ -194,6 +199,7 @@ export namespace library {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
 	        this.model = source["model"];
+	        this.album = source["album"];
 	        this.filepath = source["filepath"];
 	        this.filename = source["filename"];
 	        this.added = source["added"];

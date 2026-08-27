@@ -118,9 +118,12 @@ func (c *Core) SetFavorite(site, id string, fav bool) error      { return c.db.S
 func (c *Core) SetLabels(site, id string, labels []string) error { return c.db.SetLabels(site, id, labels) }
 func (c *Core) SetModelCover(name, cover string) error           { return c.db.SetModelCover(name, cover) }
 
-func (c *Core) SaveModelInfo(name, bio string, links []library.ModelLink) error {
-	return c.db.SaveModelInfo(name, bio, links)
+func (c *Core) SaveModelInfo(name, nickname, bio string, links []library.ModelLink) error {
+	return c.db.SaveModelInfo(name, nickname, bio, links)
 }
+
+// RenameModel renames a person across videos, photos, and their profile.
+func (c *Core) RenameModel(from, to string) error { return c.db.RenameModel(from, to) }
 
 func (c *Core) MarkWatched(site, id string) {
 	_ = c.db.MarkWatched(site, id, time.Now().Format("2006-01-02 15:04:05"))
@@ -170,6 +173,12 @@ func (c *Core) SetCookieSpec(spec string)                            { c.dl.SetC
 
 // Import copies local files/folders into the library under model.
 func (c *Core) Import(paths []string, model string) { c.dl.Import(paths, model) }
+
+// ImportPhotosFromURL downloads a web gallery's photos into model's album
+// (async; progress on the "import" event stream).
+func (c *Core) ImportPhotosFromURL(url, model, album string) {
+	c.dl.ImportPhotosFromURL(url, model, album)
+}
 
 // BackupCatalogue checkpoints and copies the catalogue db to .trove/backups
 // with a timestamped name, returning the backup path. Your media isn't touched.

@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 
 	"trove/internal/core"
@@ -34,8 +36,22 @@ func New(c *core.Core, hub *Hub, ui fs.FS) *Server {
 // Handler returns the API handler wrapped in permissive CORS, so the desktop
 // webview (a different origin than the in-process server) and LAN browsers can
 // call it. Everything served is local, so a wildcard origin is acceptable.
+// TROVE_HTTP_LOG=1 additionally logs every request (with client, Range, and
+// User-Agent) — for diagnosing what a phone actually asks for.
 func (s *Server) Handler() http.Handler {
+	logAll := os.Getenv("TROVE_HTTP_LOG") == "1"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if logAll && r.URL.Path != "/api/events" {
+			ua := r.UserAgent()
+			if len(ua) > 60 {
+				ua = ua[:60]
+			}
+			q := r.URL.RawQuery
+			if len(q) > 90 {
+				q = q[:90]
+			}
+			log.Printf("HTTP %s %s %s?%s range=%q ua=%q", r.RemoteAddr, r.Method, r.URL.Path, q, r.Header.Get("Range"), ua)
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -53,6 +69,17 @@ func (s *Server) routes(ui fs.FS) {
 	// --- events + media ---
 	m.Handle("GET /api/events", s.hub)
 	m.HandleFunc("GET /media", s.core.ServeMedia)
+
+	// Client-side diagnostics beacon: the feed posts its render state here so
+	// devices without a devtools console (phones) can be debugged from the
+	// server log. Logged only when TROVE_HTTP_LOG=1.
+	m.HandleFunc("POST /api/clientlog", func(w http.ResponseWriter, r *http.Request) {
+		if os.Getenv("TROVE_HTTP_LOG") == "1" {
+			b, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+			log.Printf("CLIENT %s %s", r.RemoteAddr, b)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	m.HandleFunc("GET /rthumb", s.core.ServeRemoteThumb)
 
 	// --- catalogue reads ---
@@ -96,7 +123,9 @@ func (s *Server) routes(ui fs.FS) {
 	post(m, "/api/settitle", func(b body) (any, error) { return ok, s.core.SetTitle(b.Site, b.ID, b.Title) })
 	post(m, "/api/setfavorite", func(b body) (any, error) { return ok, s.core.SetFavorite(b.Site, b.ID, b.Fav) })
 	post(m, "/api/setlabels", func(b body) (any, error) { return ok, s.core.SetLabels(b.Site, b.ID, b.Labels) })
-	post(m, "/api/savemodelinfo", func(b body) (any, error) { return ok, s.core.SaveModelInfo(b.Name, b.Bio, b.Links) })
+	post(m, "/api/savemodelinfo", func(b body) (any, error) { return ok, s.core.SaveModelInfo(b.Name, b.Nickname, b.Bio, b.Links) })
+	post(m, "/api/model/rename", func(b body) (any, error) { return ok, s.core.RenameModel(b.Name, b.NewName) })
+	post(m, "/api/photos/from-url", func(b body) (any, error) { s.core.ImportPhotosFromURL(b.URL, b.Model, b.Name); return ok, nil })
 	post(m, "/api/setmodelcover", func(b body) (any, error) { return ok, s.core.SetModelCover(b.Name, b.Cover) })
 	post(m, "/api/avatar/url", func(b body) (any, error) { return ok, s.core.SetAvatarFromURL(b.Name, b.URL) })
 	post(m, "/api/avatar/fetch", func(b body) (any, error) { set, err := s.core.FetchAvatarFor(b.Name); return map[string]bool{"set": set}, err })
@@ -164,6 +193,8 @@ type body struct {
 	Paths   []string            `json:"paths"`
 	URLs    []string            `json:"urls"`
 	Links   []library.ModelLink `json:"links"`
+	Nickname string             `json:"nickname"`
+	NewName  string             `json:"newName"`
 }
 
 var ok = map[string]bool{"ok": true}

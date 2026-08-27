@@ -85,8 +85,10 @@ export const SetTitle = (site: string, id: string, title: string) => postJSON("/
 export const SetFavorite = (site: string, id: string, fav: boolean) => postJSON("/api/setfavorite", { site, id, fav });
 export const SetLabels = (site: string, id: string, labels: string[]) => postJSON("/api/setlabels", { site, id, labels });
 export const SetModelCover = (name: string, cover: string) => postJSON("/api/setmodelcover", { name, cover });
-export const SaveModelInfo = (name: string, bio: string, links: library.ModelLink[]) =>
-  postJSON("/api/savemodelinfo", { name, bio, links });
+export const SaveModelInfo = (name: string, nickname: string, bio: string, links: library.ModelLink[]) =>
+  postJSON("/api/savemodelinfo", { name, nickname, bio, links });
+// RenameModel renames a person everywhere (videos, photos, profile).
+export const RenameModel = (name: string, newName: string) => postJSON("/api/model/rename", { name, newName });
 // Avatar editing: download from a URL, or upload a file. (Picking a video frame
 // reuses SetModelCover with that video's thumbnail path.)
 export const SetAvatarFromURL = (name: string, url: string) => postJSON("/api/avatar/url", { name, url });
@@ -183,6 +185,11 @@ export const ImportFolderDialog = () =>
   isWails ? wails.ImportFolderDialog() : uploadFiles("", "video/*");
 export const ImportPhotosDialog = (model: string) =>
   isWails ? wails.ImportPhotosDialog(model) : uploadFiles(model, "image/*");
+
+// ImportPhotosFromURL downloads every photo in a web gallery page into the
+// model's album (server-side, async; progress via "import" SSE events).
+export const ImportPhotosFromURL = (url: string, model: string, album: string) =>
+  postJSON("/api/photos/from-url", { url, model, name: album });
 
 // pickFile shows the browser's file chooser and resolves with the chosen files.
 function pickFile(accept: string, multiple: boolean): Promise<File[]> {

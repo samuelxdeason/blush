@@ -14,6 +14,11 @@ body,
   --ac-soft: color-mix(in oklab, var(--ac), #fff 30%); /* creamy swirl of the flavor */
   --ac-ink: #fffdfa; /* readable cream text on the accent */
   --milk: #131118; /* page background, referenced by rings + scrims */
+  /* Bottom tab bar metrics, shared with the feed (which stops above the bar in
+     portrait). The safe-area inset is trimmed so the bar hugs the bottom of the
+     screen instead of floating a full home-indicator height above it. */
+  --tabbar-pb: max(0px, calc(env(safe-area-inset-bottom) - 22px));
+  --tabbar-h: calc(57px + var(--tabbar-pb));
 }
 
 body {
@@ -29,6 +34,18 @@ body {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   -webkit-tap-highlight-color: transparent;
+  /* App-like touch feel: long-presses and swipes must never start iOS text
+     selection or the copy/look-up callout. Text entry opts back in below. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+input,
+textarea,
+[contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 ::selection {
@@ -191,6 +208,27 @@ textarea:focus {
   contain: layout style;
 }
 
+/* The feed shell is a portaled fixed layer. On phones held upright it stops
+   above the bottom tab bar (so the tabs stay usable, TikTok-style); in
+   landscape and on desktop it goes edge-to-edge for full immersion. */
+.feedshell {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: #000;
+}
+@media (max-width: 767px) and (orientation: portrait) {
+  .feedshell {
+    bottom: var(--tabbar-h);
+  }
+}
+
+/* Feed cells fill the shell's scroller exactly, whatever its height — one
+   cell per screenful is what makes the snap paging work. */
+.feedcell {
+  height: 100%;
+}
+
 /* Feed: double-tap heart burst. */
 @keyframes heartburst {
   0% { opacity: 0; transform: scale(0.4) rotate(-8deg); }
@@ -200,6 +238,15 @@ textarea:focus {
   100% { opacity: 0; transform: scale(1.2) translateY(-30px); }
 }
 .heartburst { animation: heartburst 0.75s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+
+/* Horizontal chip strips scroll instead of wrapping (filter/action rows). */
+.chipstrip {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.chipstrip::-webkit-scrollbar {
+  display: none;
+}
 
 /* Page + element entrance motion. */
 @keyframes rise {

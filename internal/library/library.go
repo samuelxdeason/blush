@@ -49,6 +49,7 @@ type Video struct {
 // Model summarises one (editable) model grouping for the unified library.
 type Model struct {
 	Name         string `json:"name"`  // "" = Unassigned
+	Nickname     string `json:"nickname"` // optional display name; "" = show Name
 	Count        int    `json:"count"`
 	TotalSeconds int    `json:"totalSeconds"`
 	Bytes        int64  `json:"bytes"`
@@ -64,16 +65,18 @@ type ModelLink struct {
 
 // ModelInfo is a model's editable profile.
 type ModelInfo struct {
-	Name  string      `json:"name"`
-	Bio   string      `json:"bio"`
-	Links []ModelLink `json:"links"`
-	Cover string      `json:"cover"` // absolute path to a chosen cover image
+	Name     string      `json:"name"`
+	Nickname string      `json:"nickname"` // optional display name shown across the UI
+	Bio      string      `json:"bio"`
+	Links    []ModelLink `json:"links"`
+	Cover    string      `json:"cover"` // absolute path to a chosen cover image
 }
 
 // Photo is an image attached to a model's page.
 type Photo struct {
 	ID       string `json:"id"`
 	Model    string `json:"model"`
+	Album    string `json:"album"` // optional grouping ("" = loose photos)
 	Filepath string `json:"filepath"`
 	Filename string `json:"filename"`
 	Added    string `json:"added"`
@@ -191,6 +194,8 @@ func Open(path, root string) (*DB, error) {
 	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN favorite INTEGER DEFAULT 0`)
 	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN labels TEXT`)
 	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN position REAL`)
+	_, _ = sqlDB.Exec(`ALTER TABLE model_info ADD COLUMN nickname TEXT`)
+	_, _ = sqlDB.Exec(`ALTER TABLE photos ADD COLUMN album TEXT`)
 	// Backfill: existing rows adopt their uploader as the model (one-time; only
 	// touches rows where model is still NULL, i.e. right after the column is added).
 	_, _ = sqlDB.Exec(`UPDATE videos SET model = uploader WHERE model IS NULL`)
@@ -444,8 +449,8 @@ func (db *DB) VideosByLabel(label string) ([]Video, error) {
 // GetModelInfo returns a model's profile (empty if none saved yet).
 func (db *DB) GetModelInfo(name string) (ModelInfo, error) {
 	info := ModelInfo{Name: name, Links: []ModelLink{}}
-	var bio, links, cover sql.NullString
-	err := db.sql.QueryRow(`SELECT bio,links,cover FROM model_info WHERE name=?`, name).Scan(&bio, &links, &cover)
+	var bio, links, cover, nick sql.NullString
+	err := db.sql.QueryRow(`SELECT bio,links,cover,nickname FROM model_info WHERE name=?`, name).Scan(&bio, &links, &cover, &nick)
 	if err == sql.ErrNoRows {
 		return info, nil
 	}
@@ -453,6 +458,7 @@ func (db *DB) GetModelInfo(name string) (ModelInfo, error) {
 		return info, err
 	}
 	info.Bio = bio.String
+	info.Nickname = nick.String
 	if links.String != "" {
 		_ = json.Unmarshal([]byte(links.String), &info.Links)
 	}
@@ -460,13 +466,68 @@ func (db *DB) GetModelInfo(name string) (ModelInfo, error) {
 	return info, nil
 }
 
-// SaveModelInfo upserts bio + links (preserves any existing cover).
-func (db *DB) SaveModelInfo(name, bio string, links []ModelLink) error {
+// SaveModelInfo upserts nickname + bio + links (preserves any existing cover).
+func (db *DB) SaveModelInfo(name, nickname, bio string, links []ModelLink) error {
 	_, _ = db.sql.Exec(`INSERT OR IGNORE INTO model_info(name) VALUES(?)`, name)
 	b, _ := json.Marshal(links)
-	_, err := db.sql.Exec(`UPDATE model_info SET bio=?, links=?, updated=? WHERE name=?`,
-		bio, string(b), time.Now().Format("2006-01-02 15:04:05"), name)
+	_, err := db.sql.Exec(`UPDATE model_info SET nickname=?, bio=?, links=?, updated=? WHERE name=?`,
+		strings.TrimSpace(nickname), bio, string(b), time.Now().Format("2006-01-02 15:04:05"), name)
 	return err
+}
+
+// RenameModel renames a person everywhere: every video's model array, their
+// photos, and the profile row. If a profile already exists under the new name
+// it wins and the old row is dropped (videos still merge under the new name).
+func (db *DB) RenameModel(from, to string) error {
+	from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+	if from == "" || to == "" || from == to {
+		return nil
+	}
+	tok, _ := json.Marshal(from) // quoted token inside the JSON array
+	rows, err := db.sql.Query(`SELECT rowid, COALESCE(model,'') FROM videos WHERE model LIKE ?`, "%"+string(tok)+"%")
+	if err != nil {
+		return err
+	}
+	type hit struct {
+		rowid int64
+		raw   string
+	}
+	var hits []hit
+	for rows.Next() {
+		var h hit
+		if rows.Scan(&h.rowid, &h.raw) == nil {
+			hits = append(hits, h)
+		}
+	}
+	rows.Close()
+	for _, h := range hits {
+		arr := parseModels(h.raw)
+		out := make([]string, 0, len(arr))
+		for _, m := range arr {
+			if m == from {
+				m = to
+			}
+			dup := false
+			for _, x := range out {
+				if x == m {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				out = append(out, m)
+			}
+		}
+		if _, err := db.sql.Exec(`UPDATE videos SET model=? WHERE rowid=?`, jsonArr(out), h.rowid); err != nil {
+			return err
+		}
+	}
+	_, _ = db.sql.Exec(`UPDATE photos SET model=? WHERE model=?`, to, from)
+	// Move the profile row; if the new name already has one, keep it.
+	if _, err := db.sql.Exec(`UPDATE model_info SET name=? WHERE name=?`, to, from); err != nil {
+		_, _ = db.sql.Exec(`DELETE FROM model_info WHERE name=?`, from)
+	}
+	return nil
 }
 
 // SetModelCover sets a model's cover image (preserves bio + links).
@@ -534,17 +595,19 @@ func (db *DB) RemoveModelFromAll(name string) error {
 // AddPhoto inserts/updates a photo (paths stored relative to root).
 func (db *DB) AddPhoto(p Photo) error {
 	_, err := db.sql.Exec(`
-INSERT INTO photos (id,model,filepath,filename,added) VALUES (?,?,?,?,?)
-ON CONFLICT(id) DO UPDATE SET model=excluded.model, filepath=excluded.filepath,
-  filename=excluded.filename`,
-		p.ID, p.Model, db.rel(p.Filepath), p.Filename, p.Added)
+INSERT INTO photos (id,model,album,filepath,filename,added) VALUES (?,?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET model=excluded.model, album=excluded.album,
+  filepath=excluded.filepath, filename=excluded.filename`,
+		p.ID, p.Model, p.Album, db.rel(p.Filepath), p.Filename, p.Added)
 	return err
 }
 
-// PhotosByModel returns a model's photos, newest first (paths absolute).
+// PhotosByModel returns a model's photos, album-grouped then newest first
+// (paths absolute).
 func (db *DB) PhotosByModel(model string) ([]Photo, error) {
 	rows, err := db.sql.Query(
-		`SELECT id,model,filepath,filename,added FROM photos WHERE COALESCE(model,'')=? ORDER BY added DESC`, model)
+		`SELECT id,model,COALESCE(album,''),filepath,filename,added FROM photos
+		 WHERE COALESCE(model,'')=? ORDER BY COALESCE(album,''), added DESC`, model)
 	if err != nil {
 		return nil, err
 	}
@@ -552,7 +615,7 @@ func (db *DB) PhotosByModel(model string) ([]Photo, error) {
 	var out []Photo
 	for rows.Next() {
 		var p Photo
-		if err := rows.Scan(&p.ID, &p.Model, &p.Filepath, &p.Filename, &p.Added); err != nil {
+		if err := rows.Scan(&p.ID, &p.Model, &p.Album, &p.Filepath, &p.Filename, &p.Added); err != nil {
 			return nil, err
 		}
 		p.Filepath = db.abs(p.Filepath)
@@ -652,13 +715,19 @@ func (db *DB) Models() ([]Model, error) {
 		return nil, err
 	}
 
-	// cover overrides
+	// cover + nickname overrides
 	covers := map[string]string{}
-	if crows, e := db.sql.Query(`SELECT name, COALESCE(cover,'') FROM model_info`); e == nil {
+	nicks := map[string]string{}
+	if crows, e := db.sql.Query(`SELECT name, COALESCE(cover,''), COALESCE(nickname,'') FROM model_info`); e == nil {
 		for crows.Next() {
-			var n, c string
-			if crows.Scan(&n, &c) == nil && c != "" {
-				covers[n] = c
+			var n, c, nk string
+			if crows.Scan(&n, &c, &nk) == nil {
+				if c != "" {
+					covers[n] = c
+				}
+				if nk != "" {
+					nicks[n] = nk
+				}
 			}
 		}
 		crows.Close()
@@ -677,7 +746,7 @@ func (db *DB) Models() ([]Model, error) {
 			thumb = c
 		}
 		out = append(out, Model{
-			Name: name, Count: a.count, TotalSeconds: a.seconds, Bytes: a.bytes,
+			Name: name, Nickname: nicks[name], Count: a.count, TotalSeconds: a.seconds, Bytes: a.bytes,
 			Sites: strings.Join(sites, ","), Thumbnail: db.abs(thumb),
 		})
 	}
