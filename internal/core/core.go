@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"media-vault/internal/downloader"
-	"media-vault/internal/library"
+	"blush/internal/downloader"
+	"blush/internal/library"
 )
 
 // Core holds the live engine: the catalogue DB and the download queue. Hosts

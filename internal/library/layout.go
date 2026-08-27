@@ -6,7 +6,7 @@ import "strings"
 // "<site>-<id>.<ext>", and sidecars live under .keepsake (meta/ for the
 // .info.json files, thumbs/ for poster images). Everything human-readable —
 // titles, models, uploaders — lives only in the catalogue. The legacy
-// per-site/per-uploader tree remains readable; `mediavaultd migrate-flat`
+// per-site/per-uploader tree remains readable; `blushd migrate-flat`
 // converts a vault in place.
 const (
 	MediaDirName  = "media"

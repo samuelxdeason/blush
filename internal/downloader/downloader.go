@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"media-vault/internal/library"
+	"blush/internal/library"
 )
 
 // Job is one queued download, as shown in the UI.

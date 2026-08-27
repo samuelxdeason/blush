@@ -12,10 +12,10 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
-	"media-vault/internal/core"
-	"media-vault/internal/downloader"
-	"media-vault/internal/library"
-	"media-vault/internal/server"
+	"blush/internal/core"
+	"blush/internal/downloader"
+	"blush/internal/library"
+	"blush/internal/server"
 )
 
 // App is the thin desktop shell. The catalogue, downloads, and media serving all

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"media-vault/internal/library"
+	"blush/internal/library"
 )
 
 // buildLegacyVault creates a miniature pre-migration vault: a PornHub download

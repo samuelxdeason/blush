@@ -1,4 +1,4 @@
-// Command mediavaultd is the headless Media Vault server: it runs the core
+// Command blushd is the headless Media Vault server: it runs the core
 // engine and exposes the HTTP API, SSE events, range-served media, and the web
 // UI on one port — suitable for running on a NAS or any always-on machine.
 package main
@@ -12,12 +12,12 @@ import (
 	"os"
 	"time"
 
-	"media-vault/internal/core"
-	"media-vault/internal/server"
+	"blush/internal/core"
+	"blush/internal/server"
 )
 
 func main() {
-	// Subcommand: `mediavaultd migrate-flat` converts the vault to the flat
+	// Subcommand: `blushd migrate-flat` converts the vault to the flat
 	// media/ layout (dry run unless --apply). Stop the daemon before applying.
 	if len(os.Args) > 1 && os.Args[1] == "migrate-flat" {
 		fs := flag.NewFlagSet("migrate-flat", flag.ExitOnError)

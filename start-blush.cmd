@@ -16,6 +16,6 @@ if defined LANIP (
 )
 echo.
 
-mediavaultd.exe -addr 0.0.0.0:8899 -ui frontend\dist
+blushd.exe -addr 0.0.0.0:8899 -ui frontend\dist
 pause
 

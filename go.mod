@@ -1,4 +1,4 @@
-module media-vault
+module blush
 
 go 1.25.0
 

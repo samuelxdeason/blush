@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"media-vault/internal/library"
+	"blush/internal/library"
 )
 
 // Flat-layout migration: moves every catalogued file from the legacy
@@ -552,7 +552,7 @@ func RollbackFlatMigration(db *library.DB, root, journalPath string, logf func(s
 	return nil
 }
 
-// RunFlatMigration is the CLI entry point behind `mediavaultd migrate-flat`.
+// RunFlatMigration is the CLI entry point behind `blushd migrate-flat`.
 // Dry run by default: prints the plan and writes a manifest. --apply executes;
 // --rollback replays a journal backwards.
 func RunFlatMigration(root string, apply bool, rollbackJournal string) error {
@@ -614,8 +614,8 @@ func RunFlatMigration(root string, apply bool, rollbackJournal string) error {
 	logf("applying…")
 	journal, err := ApplyFlatMigration(db, root, plan, logf)
 	if err != nil {
-		return fmt.Errorf("%w\nThe run is resumable: re-run `mediavaultd migrate-flat --apply`, or roll back with --rollback %s", err, journal)
+		return fmt.Errorf("%w\nThe run is resumable: re-run `blushd migrate-flat --apply`, or roll back with --rollback %s", err, journal)
 	}
-	logf("done. Roll back anytime with: mediavaultd migrate-flat --rollback %s", journal)
+	logf("done. Roll back anytime with: blushd migrate-flat --rollback %s", journal)
 	return nil
 }

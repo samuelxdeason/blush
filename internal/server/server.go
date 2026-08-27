@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"media-vault/internal/core"
-	"media-vault/internal/library"
+	"blush/internal/core"
+	"blush/internal/library"
 )
 
 // Server wires the core engine and the event hub onto an http.Handler.
