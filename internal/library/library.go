@@ -198,22 +198,24 @@ func Open(path, root string) (*DB, error) {
 	db := &DB{sql: sqlDB, root: root}
 	db.relativize()           // convert any legacy absolute paths to relative (idempotent)
 	db.migrateModelsToArray() // single-value model -> JSON array (idempotent)
-	db.migrateStatePrefix()   // .keepsake\ paths -> .xxx\ after the state dir rename (idempotent)
+	db.migrateStatePrefix()   // legacy state-dir paths (.keepsake\, .xxx\) -> .trove\ (idempotent)
 	return db, nil
 }
 
-// migrateStatePrefix rewrites stored paths that point into the old .keepsake
-// state folder after its rename to .xxx (thumbnails and model covers live
-// there; media paths never do). Idempotent: matches nothing once rewritten.
+// migrateStatePrefix rewrites stored paths that point into an old state folder
+// after its renames (.keepsake -> .xxx -> .trove; thumbnails and model covers
+// live there, media paths never do). Idempotent: matches nothing once rewritten.
 func (db *DB) migrateStatePrefix() {
-	for _, sep := range []string{`\`, `/`} {
-		oldPrefix := ".keepsake" + sep
-		newPrefix := ".xxx" + sep
-		from := len(oldPrefix) + 1 // SQLite substr is 1-based
-		_, _ = db.sql.Exec(`UPDATE videos SET thumbnail = ? || substr(thumbnail, ?) WHERE thumbnail LIKE ?`,
-			newPrefix, from, oldPrefix+"%")
-		_, _ = db.sql.Exec(`UPDATE model_info SET cover = ? || substr(cover, ?) WHERE cover LIKE ?`,
-			newPrefix, from, oldPrefix+"%")
+	for _, oldName := range []string{".keepsake", ".xxx"} {
+		for _, sep := range []string{`\`, `/`} {
+			oldPrefix := oldName + sep
+			newPrefix := ".trove" + sep
+			from := len(oldPrefix) + 1 // SQLite substr is 1-based
+			_, _ = db.sql.Exec(`UPDATE videos SET thumbnail = ? || substr(thumbnail, ?) WHERE thumbnail LIKE ?`,
+				newPrefix, from, oldPrefix+"%")
+			_, _ = db.sql.Exec(`UPDATE model_info SET cover = ? || substr(cover, ?) WHERE cover LIKE ?`,
+				newPrefix, from, oldPrefix+"%")
+		}
 	}
 }
 
@@ -808,7 +810,10 @@ func (db *DB) RecentlyDownloaded(limit int) ([]Video, error) {
 
 // AllVideos returns one page of the whole (non-hidden) library for the
 // browse-everything timeline. sort picks the order; site/favOnly narrow it.
-func (db *DB) AllVideos(limit, offset int, sort, site string, favOnly bool) ([]Video, error) {
+// sort "shuffle" is a seeded pseudo-random order: the same seed gives the same
+// order (so offset paging stays consistent within a session), a fresh seed
+// reshuffles the whole library.
+func (db *DB) AllVideos(limit, offset int, sort, site string, favOnly bool, seed int64) ([]Video, error) {
 	order := map[string]string{
 		"newest":  "added DESC, id",
 		"oldest":  "added ASC, id",
@@ -816,6 +821,15 @@ func (db *DB) AllVideos(limit, offset int, sort, site string, favOnly bool) ([]V
 		"largest": "COALESCE(filesize,0) DESC, added DESC",
 		"title":   "LOWER(COALESCE(NULLIF(title,''),uploader)) ASC",
 	}[sort]
+	if sort == "shuffle" {
+		// Knuth-style multiplicative hash over rowid, offset by the seed. Kept in
+		// int64 range: (rowid + seed) stays under ~2^31, ×2654435761 under 2^63.
+		s := seed % 1_000_000_007
+		if s < 0 {
+			s += 1_000_000_007
+		}
+		order = fmt.Sprintf("((rowid+%d)*2654435761)%%1000000007, rowid", s)
+	}
 	if order == "" {
 		order = "added DESC, id"
 	}

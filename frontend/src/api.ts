@@ -1,4 +1,4 @@
-// api.ts is the single data path for the UI. It talks to the Media Vault server
+// api.ts is the single data path for the UI. It talks to the Trove server
 // over HTTP (+ Server-Sent Events for live updates), and exports the same names
 // App.tsx used to import from the Wails bindings, so component code is unchanged.
 //
@@ -53,9 +53,10 @@ export const Collections = () => getJSON<library.Collection[]>("/api/collections
 export const Queue = () => getJSON<downloader.Job[]>("/api/queue");
 
 // AllVideos pages through the whole library (the browse-everything timeline).
-// sort: newest | oldest | longest | largest | title. site/fav narrow the set.
-export const AllVideos = (limit: number, offset: number, sort: string, site: string, fav: boolean) =>
-  getJSON<Video[]>("/api/videos" + qs({ limit, offset, sort, site, fav: fav ? 1 : 0 }));
+// sort: newest | oldest | longest | largest | title | shuffle. site/fav narrow
+// the set. seed keeps a "shuffle" order stable across pages within a session.
+export const AllVideos = (limit: number, offset: number, sort: string, site: string, fav: boolean, seed = 0) =>
+  getJSON<Video[]>("/api/videos" + qs({ limit, offset, sort, site, fav: fav ? 1 : 0, seed }));
 export const VideosByModel = (model: string) => getJSON<Video[]>("/api/videos/by-model" + qs({ model }));
 export const VideosByLabel = (label: string) => getJSON<Video[]>("/api/videos/by-label" + qs({ label }));
 export const VideosByCollection = (id: number) => getJSON<Video[]>("/api/videos/by-collection" + qs({ id }));
@@ -115,7 +116,7 @@ export const RebuildLibrary = () => postJSON<{ count: number }>("/api/rebuild");
 // OptimizeStreaming losslessly remuxes mp4s whose index sits at the end of the
 // file (they stall before playing on phones). Progress arrives via "optimize" SSE.
 export const OptimizeStreaming = () => postJSON("/api/optimize");
-// BackupCatalogue copies the catalogue db to .keepsake/backups and returns its path.
+// BackupCatalogue copies the catalogue db to .trove/backups and returns its path.
 export const BackupCatalogue = () => postJSON<{ path: string }>("/api/backup");
 
 /* ---------------- collections ---------------- */

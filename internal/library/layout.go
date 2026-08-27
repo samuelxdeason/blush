@@ -3,15 +3,15 @@ package library
 import "strings"
 
 // Flat vault layout: every media file lives directly in <root>/media as
-// "<site>-<id>.<ext>", and sidecars live under .keepsake (meta/ for the
+// "<site>-<id>.<ext>", and sidecars live under .trove (meta/ for the
 // .info.json files, thumbs/ for poster images). Everything human-readable —
 // titles, models, uploaders — lives only in the catalogue. The legacy
-// per-site/per-uploader tree remains readable; `blushd migrate-flat`
+// per-site/per-uploader tree remains readable; `troved migrate-flat`
 // converts a vault in place.
 const (
 	MediaDirName  = "media"
-	MetaDirName   = "meta"   // under .keepsake
-	ThumbsDirName = "thumbs" // under .keepsake
+	MetaDirName   = "meta"   // under .trove
+	ThumbsDirName = "thumbs" // under .trove
 )
 
 // FlatBase returns the canonical flat-layout basename (without extension) for

@@ -146,6 +146,14 @@ function Icon({ name, className = "w-[18px] h-[18px]" }: { name: string; classNa
     menu: <path d="M4.5 7.2h15M4.5 12h15M4.5 16.8h15" />,
     search: <><circle cx="11" cy="11" r="6.6" /><path d="m15.9 15.9 4.1 4.1" /></>,
     grid: <><rect x="4" y="4" width="6.8" height="6.8" rx="1.8" /><rect x="13.2" y="4" width="6.8" height="6.8" rx="1.8" /><rect x="4" y="13.2" width="6.8" height="6.8" rx="1.8" /><rect x="13.2" y="13.2" width="6.8" height="6.8" rx="1.8" /></>,
+    x: <path d="M6.2 6.2l11.6 11.6M17.8 6.2 6.2 17.8" />,
+    "heart-fill": <path d="M12 20.2C7.2 16.4 3.8 13.4 3.8 9.8 3.8 7.4 5.7 5.5 8 5.5c1.6 0 3.1.9 4 2.2.9-1.3 2.4-2.2 4-2.2 2.3 0 4.2 1.9 4.2 4.3 0 3.6-3.4 6.6-8.2 10.4z" fill="currentColor" stroke="none" />,
+    bookmark: <path d="M7 4.6h10a1 1 0 0 1 1 1v13.8l-6-3.9-6 3.9V5.6a1 1 0 0 1 1-1z" />,
+    "bookmark-fill": <path d="M7 4.6h10a1 1 0 0 1 1 1v13.8l-6-3.9-6 3.9V5.6a1 1 0 0 1 1-1z" fill="currentColor" stroke="none" />,
+    volume: <><path d="M4.6 9.6v4.8h2.9l4.4 3.7V5.9L7.5 9.6z" /><path d="M15.3 9.2a4 4 0 0 1 0 5.6M17.9 6.9a7.4 7.4 0 0 1 0 10.2" /></>,
+    "volume-off": <><path d="M4.6 9.6v4.8h2.9l4.4 3.7V5.9L7.5 9.6z" /><path d="m15.4 9.7 4.6 4.6M20 9.7l-4.6 4.6" /></>,
+    shuffle: <><path d="M4 7.2h2.9c4.7 0 4.5 9.6 9.2 9.6H19M4 16.8h2.9c1.9 0 3-1.4 3.9-3M19 7.2h-2.9c-1.9 0-3 1.4-3.9 3" /><path d="m16.6 4.8 2.6 2.4-2.6 2.4M16.6 14.4l2.6 2.4-2.6 2.4" /></>,
+    "play-fill": <path d="M8.6 5.6v12.8L19.2 12z" fill="currentColor" stroke="none" />,
   };
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.9}
@@ -301,7 +309,7 @@ export default function App() {
         style={{ paddingTop: "env(safe-area-inset-top)" }}>
         <div className="px-5 py-6 flex items-center gap-2.5">
           <Swirl className="w-7 h-7 shrink-0" />
-          <span className="text-lg font-extrabold tracking-tight text-fg">blush<span className="text-accent">.xxx</span></span>
+          <span className="text-lg font-extrabold tracking-tight text-fg">tr<span className="text-accent">o</span>ve</span>
         </div>
 
         <SideItem icon="home" active={route.kind === "home"} onClick={() => go({ kind: "home" })}>Home</SideItem>
@@ -349,7 +357,7 @@ export default function App() {
           </div>
         ) : route.kind === "home" ? <Home onPlay={play} onOpenModel={(name) => go({ kind: "model", name })} onGo={go} version={version} />
           : route.kind === "videos" ? <VideosPage version={version} modelNames={modelNames} collections={collections} onPlay={play} onChanged={reload} onOpenTags={() => go({ kind: "categories" })} />
-          : route.kind === "feed" ? <Feed onOpenModel={(name) => go({ kind: "model", name })} onClose={() => go({ kind: "home" })} collections={collections} allLabels={allLabels} onChanged={reload} />
+          : route.kind === "feed" ? <Feed onOpenModel={(name) => go({ kind: "model", name })} onClose={() => go({ kind: "home" })} collections={collections} allLabels={allLabels} models={models} onChanged={reload} />
           : route.kind === "downloads" ? <Downloads queue={queue} />
           : route.kind === "settings" ? <SettingsPage />
           : route.kind === "browse" ? <BrowseSync onEnqueued={() => go({ kind: "downloads" })} />
@@ -1707,7 +1715,7 @@ function BrowseSync({ onEnqueued }: { onEnqueued: () => void }) {
       {/* Saved syncs */}
       {!showList && (
         lists.length === 0
-          ? <Empty icon="✨" action={{ label: "+ Follow someone", onClick: () => setAdding(true) }}>You're not following anything yet. Add a person, channel, or your favorites and blush.xxx will keep track of what's new.</Empty>
+          ? <Empty icon="✨" action={{ label: "+ Follow someone", onClick: () => setAdding(true) }}>You're not following anything yet. Add a person, channel, or your favorites and trove will keep track of what's new.</Empty>
           : (
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(240px,1fr))" }}>
               {lists.map((l) => (
@@ -1927,7 +1935,7 @@ function SettingsPage() {
         <div className="text-sm font-semibold mb-1">Backup &amp; safety</div>
         <p className="text-xs text-muted mb-3 leading-relaxed">
           Back up your catalogue (models, favorites, labels, collections, resume points) to a timestamped
-          file in <code>.keepsake/backups</code>. Your media files aren't copied — only the database.
+          file in <code>.trove/backups</code>. Your media files aren't copied — only the database.
         </p>
         <div className="flex items-center gap-3 flex-wrap">
           <button onClick={doBackup} disabled={backuping}
@@ -2075,50 +2083,120 @@ function QueueItem({ j }: { j: Job }) {
 
 /* ---------------- Feed (TikTok-style vertical swipe) ---------------- */
 
-function Feed({ onOpenModel, onClose, collections, allLabels, onChanged }:
-  { onOpenModel: (name: string) => void; onClose: () => void; collections: Collection[]; allLabels: string[]; onChanged: () => void }) {
+type FeedMode = "shuffle" | "new" | "liked";
+const FEED_PAGE = 20;
+
+function Feed({ onOpenModel, onClose, collections, allLabels, models, onChanged }:
+  { onOpenModel: (name: string) => void; onClose: () => void; collections: Collection[]; allLabels: string[]; models: Model[]; onChanged: () => void }) {
   const [videos, setVideos] = useState<Video[]>([]);
+  const [mode, setMode] = useState<FeedMode>("shuffle");
   const [current, setCurrent] = useState(0);
   const [muted, setMuted] = useState(true);
-  useEffect(() => { RecentlyDownloaded().then((v) => setVideos((v || []).slice(0, 60))); }, []);
-  // Stable callbacks so scrolling doesn't re-create every item's observer.
-  const onVisible = useCallback((i: number) => setCurrent(i), []);
-  const onToggleMute = useCallback(() => setMuted((m) => !m), []);
+  const [loaded, setLoaded] = useState(false);
+  // A fresh seed per visit: the shuffle order is random every time you open the
+  // feed, but stable across pages while you scroll (the server hashes on it).
+  const seedRef = useRef(1 + Math.floor(Math.random() * 1e9));
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // gen guards against a stale in-flight page landing after a mode switch.
+  const pager = useRef({ gen: 0, count: 0, loading: false, exhausted: false });
 
-  if (!videos.length) {
-    return (
-      <div className="fixed inset-0 z-50 bg-black grid place-items-center text-white/70 text-sm">
-        <div className="text-center">Nothing to play yet — download or import some videos.</div>
-        <button onClick={onClose} className="absolute top-4 left-4 w-10 h-10 rounded-full bg-white/15 text-white grid place-items-center">✕</button>
-      </div>
-    );
-  }
+  const avatars = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const x of models) if (x.name && x.thumbnail) m.set(x.name, x.thumbnail);
+    return m;
+  }, [models]);
+
+  const load = useCallback(async (reset: boolean, m: FeedMode) => {
+    const p = pager.current;
+    if (p.loading || (!reset && p.exhausted)) return;
+    p.loading = true;
+    const gen = p.gen;
+    const offset = reset ? 0 : p.count;
+    let page: Video[] = [];
+    try {
+      page = (await AllVideos(FEED_PAGE, offset, m === "new" ? "newest" : "shuffle", "", m === "liked", seedRef.current)) || [];
+    } catch {}
+    if (pager.current.gen !== gen) return; // superseded by a mode switch
+    p.loading = false;
+    p.exhausted = page.length < FEED_PAGE;
+    p.count = offset + page.length;
+    setLoaded(true);
+    setVideos((prev) => {
+      const base = reset ? [] : prev;
+      const seen = new Set(base.map((v) => v.site + "/" + v.id));
+      return [...base, ...page.filter((v) => !seen.has(v.site + "/" + v.id))];
+    });
+  }, []);
+
+  useEffect(() => { load(true, "shuffle"); }, [load]);
+
+  const switchMode = (m: FeedMode) => {
+    if (m === "shuffle") seedRef.current = 1 + Math.floor(Math.random() * 1e9); // re-tapping Shuffle deals a new order
+    pager.current = { gen: pager.current.gen + 1, count: 0, loading: false, exhausted: false };
+    setMode(m); setCurrent(0); setLoaded(false); setVideos([]);
+    scrollRef.current?.scrollTo({ top: 0 });
+    load(true, m);
+  };
+
+  // Top up the queue a few cards before the end so scrolling never hits a wall.
+  useEffect(() => { if (videos.length && current >= videos.length - 4) load(false, mode); }, [current, videos.length, mode, load]);
+
+  // Stable callback so scrolling doesn't re-create every item's observer.
+  const onVisible = useCallback((i: number) => setCurrent(i), []);
+
   return (
-    <div className="fixed inset-0 z-50 bg-black overflow-y-scroll snap-y snap-mandatory overscroll-y-contain">
-      <button onClick={onClose} aria-label="Close feed"
-        className="fixed top-4 left-4 z-[55] w-10 h-10 rounded-full bg-black/40 text-white grid place-items-center backdrop-blur">✕</button>
+    <div ref={scrollRef} className="fixed inset-0 z-50 bg-black overflow-y-scroll snap-y snap-mandatory overscroll-y-contain">
+      <div className="fixed inset-x-0 top-0 z-[55] flex items-center px-3" style={{ paddingTop: "calc(env(safe-area-inset-top) + 12px)" }}>
+        <button onClick={onClose} aria-label="Close feed"
+          className="w-10 h-10 rounded-full bg-black/40 text-white grid place-items-center backdrop-blur-sm transition active:scale-90">
+          <Icon name="x" className="w-5 h-5" />
+        </button>
+        <div className="flex-1 flex justify-center">
+          <div className="flex gap-1 rounded-full bg-black/40 backdrop-blur-sm p-1">
+            {([["shuffle", "Shuffle"], ["new", "New"], ["liked", "Liked"]] as [FeedMode, string][]).map(([m, name]) => (
+              <button key={m} onClick={() => switchMode(m)}
+                className={`px-3 py-1.5 rounded-full text-[13px] font-semibold flex items-center gap-1.5 transition ${mode === m ? "bg-white text-black" : "text-white/75"}`}>
+                {m === "shuffle" && <Icon name="shuffle" className="w-3.5 h-3.5" />}{name}
+              </button>
+            ))}
+          </div>
+        </div>
+        <button onClick={() => setMuted((m) => !m)} aria-label="Toggle sound"
+          className="w-10 h-10 rounded-full bg-black/40 text-white grid place-items-center backdrop-blur-sm transition active:scale-90">
+          <Icon name={muted ? "volume-off" : "volume"} className="w-5 h-5" />
+        </button>
+      </div>
+
+      {loaded && !videos.length && (
+        <div className="h-full grid place-items-center text-white/70 text-sm text-center px-8">
+          {mode === "liked" ? "Nothing liked yet — double-tap videos you love." : "Nothing to play yet — download or import some videos."}
+        </div>
+      )}
       {videos.map((v, i) => (
         <FeedItem key={v.site + "/" + v.id} v={v} index={i} active={i === current} near={Math.abs(i - current) <= 1}
           preload={i === current || i === current + 1 ? "auto" : "metadata"}
-          muted={muted} onVisible={onVisible} onToggleMute={onToggleMute} onOpenModel={onOpenModel}
+          muted={muted} avatar={avatars.get((v.models && v.models[0]) || "")}
+          onVisible={onVisible} onOpenModel={onOpenModel}
           collections={collections} allLabels={allLabels} onChanged={onChanged} />
       ))}
     </div>
   );
 }
 
-function FeedAction({ icon, label, onClick }: { icon: string; label: string; onClick: () => void }) {
+function FeedAction({ icon, label, onClick, active }: { icon: string; label: string; onClick: () => void; active?: boolean }) {
   return (
-    <button onClick={onClick} className="flex flex-col items-center gap-1 text-white drop-shadow">
-      <span className="text-3xl leading-none">{icon}</span>
-      <span className="text-[11px] font-medium">{label}</span>
+    <button onClick={onClick} className="flex flex-col items-center gap-1 select-none">
+      <span className={`w-11 h-11 grid place-items-center rounded-full bg-black/35 backdrop-blur-sm transition active:scale-90 ${active ? "text-rose-500" : "text-white"}`}>
+        <Icon name={icon} className="w-[22px] h-[22px]" />
+      </span>
+      <span className="text-[11px] font-semibold text-white drop-shadow">{label}</span>
     </button>
   );
 }
 
-function FeedItem({ v, index, active, near, muted, preload, onVisible, onToggleMute, onOpenModel, collections, allLabels, onChanged }:
-  { v: Video; index: number; active: boolean; near: boolean; muted: boolean; preload: "auto" | "metadata";
-    onVisible: (i: number) => void; onToggleMute: () => void; onOpenModel: (name: string) => void;
+function FeedItem({ v, index, active, near, muted, preload, avatar, onVisible, onOpenModel, collections, allLabels, onChanged }:
+  { v: Video; index: number; active: boolean; near: boolean; muted: boolean; preload: "auto" | "metadata"; avatar?: string;
+    onVisible: (i: number) => void; onOpenModel: (name: string) => void;
     collections: Collection[]; allLabels: string[]; onChanged: () => void }) {
   const secRef = useRef<HTMLElement>(null);
   const vidRef = useRef<HTMLVideoElement | null>(null);
@@ -2126,7 +2204,20 @@ function FeedItem({ v, index, active, near, muted, preload, onVisible, onToggleM
   const [fav, setFav] = useState(!!v.favorite);
   const [showColl, setShowColl] = useState(false);
   const [showLabels, setShowLabels] = useState(false);
+  const [prog, setProg] = useState(0);
+  const [scrubbing, setScrubbing] = useState(false);
+  const [fast, setFast] = useState(false);
+  const [burst, setBurst] = useState<{ x: number; y: number; n: number } | null>(null);
   const primary = (v.models && v.models[0]) || "";
+  // Portrait clips go full-bleed (TikTok-style); landscape ones sit contained
+  // over a blurred blow-up of their own poster so the letterbox feels intentional.
+  const portrait = !!(v.width && v.height && v.height > v.width);
+
+  // Gesture bookkeeping: tap = pause, double-tap = like, press-and-hold = 2×.
+  const pressTimer = useRef(0);
+  const tapTimer = useRef(0);
+  const lastTap = useRef(0);
+  const longPressed = useRef(false);
 
   // Mark this item active when it scrolls into view (drives play/pause + windowing).
   useEffect(() => {
@@ -2142,49 +2233,130 @@ function FeedItem({ v, index, active, near, muted, preload, onVisible, onToggleM
   useEffect(() => {
     const vid = vidRef.current; if (!vid) return;
     if (active) { setPaused(false); vid.play().catch(() => {}); MarkWatched(v.site, v.id); }
-    else { vid.pause(); try { vid.currentTime = 0; } catch {} }
+    else { vid.pause(); try { vid.currentTime = 0; } catch {} setProg(0); }
   }, [active, v.site, v.id]);
 
-  const tap = () => {
+  const togglePlay = () => {
     const vid = vidRef.current; if (!vid) return;
     if (vid.paused) { vid.play().catch(() => {}); setPaused(false); } else { vid.pause(); setPaused(true); }
   };
-  const like = async () => { const nf = !fav; setFav(nf); v.favorite = nf; await SetFavorite(v.site, v.id, nf); };
+  const like = async (to?: boolean) => {
+    const nf = to === undefined ? !fav : to;
+    if (nf === fav) return;
+    setFav(nf); v.favorite = nf; await SetFavorite(v.site, v.id, nf);
+  };
+
+  const stopFast = () => {
+    window.clearTimeout(pressTimer.current);
+    const vid = vidRef.current;
+    if (vid) vid.playbackRate = 1;
+    setFast(false);
+  };
+  const onPointerDown = () => {
+    longPressed.current = false;
+    window.clearTimeout(pressTimer.current);
+    pressTimer.current = window.setTimeout(() => {
+      const vid = vidRef.current;
+      if (vid && !vid.paused) { longPressed.current = true; vid.playbackRate = 2; setFast(true); }
+    }, 380);
+  };
+  const onTap = (e: { clientX: number; clientY: number }) => {
+    if (longPressed.current) { longPressed.current = false; return; } // the hold already acted
+    const now = Date.now();
+    if (now - lastTap.current < 300) {
+      lastTap.current = 0;
+      window.clearTimeout(tapTimer.current);
+      const rect = secRef.current?.getBoundingClientRect();
+      setBurst((b) => ({ x: e.clientX - (rect?.left || 0), y: e.clientY - (rect?.top || 0), n: (b?.n || 0) + 1 }));
+      like(true);
+    } else {
+      lastTap.current = now;
+      tapTimer.current = window.setTimeout(togglePlay, 300); // wait out a possible second tap
+    }
+  };
+
+  const seekTo = (clientX: number) => {
+    const vid = vidRef.current; if (!vid || !vid.duration) return;
+    const frac = Math.min(1, Math.max(0, clientX / window.innerWidth));
+    vid.currentTime = frac * vid.duration;
+    setProg(frac);
+  };
 
   return (
-    <section ref={secRef} className="snap-start snap-always snapcell relative w-full flex items-center justify-center" style={{ height: "100dvh" }}>
+    <section ref={secRef} className="snap-start snap-always snapcell relative w-full overflow-hidden flex items-center justify-center bg-black" style={{ height: "100dvh" }}>
+      {near && !portrait && v.thumbnail && (
+        <img src={mediaURL(v.thumbnail)} aria-hidden
+          className="absolute inset-0 w-full h-full object-cover scale-125 blur-2xl brightness-[.35]" />
+      )}
       {near
         ? <video ref={(el) => { vidRef.current = el; if (el) el.defaultMuted = true; /* iOS: must be muted before first play() */ }}
             src={videoURL(v.filepath)} loop playsInline muted={muted} preload={preload}
             poster={v.thumbnail ? mediaURL(v.thumbnail) : undefined}
             onCanPlay={() => { const el = vidRef.current; if (active && !paused && el?.paused) el.play().catch(() => {}); }}
-            className="max-w-full max-h-full" onClick={tap} />
+            onTimeUpdate={() => { const el = vidRef.current; if (el && el.duration && !scrubbing) setProg(el.currentTime / el.duration); }}
+            className={portrait ? "absolute inset-0 w-full h-full object-cover" : "relative max-w-full max-h-full"} />
         : v.thumbnail
-          ? <img src={mediaURL(v.thumbnail)} loading="lazy" decoding="async" className="max-w-full max-h-full object-contain opacity-60" />
+          ? <img src={mediaURL(v.thumbnail)} loading="lazy" decoding="async"
+              className={portrait ? "absolute inset-0 w-full h-full object-cover opacity-70" : "relative max-w-full max-h-full object-contain opacity-70"} />
           : null}
 
-      {paused && <div className="absolute inset-0 grid place-items-center pointer-events-none text-white/85 text-7xl drop-shadow">▶</div>}
+      <div className="absolute inset-x-0 bottom-0 h-52 bg-gradient-to-t from-black/75 via-black/30 to-transparent pointer-events-none" />
 
-      <button onClick={onToggleMute} aria-label="Toggle sound"
-        className="absolute top-4 right-4 w-10 h-10 grid place-items-center rounded-full bg-black/40 text-white text-lg backdrop-blur">
-        {muted ? "🔇" : "🔊"}
-      </button>
+      {/* Gesture layer: single tap pause · double tap like · hold for 2×. */}
+      <div className="absolute inset-0" style={{ touchAction: "pan-y" }} onClick={onTap}
+        onPointerDown={onPointerDown} onPointerUp={stopFast} onPointerLeave={stopFast} onPointerCancel={stopFast} />
 
-      <div className="absolute right-3 bottom-28 flex flex-col items-center gap-5">
-        <FeedAction icon={fav ? "❤️" : "🤍"} label="Like" onClick={like} />
-        <FeedAction icon="📁" label="Save" onClick={() => setShowColl(true)} />
-        <FeedAction icon="🏷️" label="Tag" onClick={() => setShowLabels(true)} />
+      {paused && (
+        <div className="absolute inset-0 grid place-items-center pointer-events-none">
+          <Icon name="play-fill" className="w-20 h-20 text-white/90 drop-shadow-lg" />
+        </div>
+      )}
+      {fast && (
+        <div className="absolute left-1/2 -translate-x-1/2 rounded-full bg-black/55 text-white text-xs font-bold px-3 py-1.5 pointer-events-none"
+          style={{ top: "calc(env(safe-area-inset-top) + 72px)" }}>2× speed</div>
+      )}
+      {burst && (
+        <div key={burst.n} className="absolute pointer-events-none heartburst" style={{ left: burst.x - 44, top: burst.y - 44 }}>
+          <Icon name="heart-fill" className="w-[88px] h-[88px] text-rose-500 drop-shadow-lg" />
+        </div>
+      )}
+
+      <div className="absolute right-2.5 z-[52] flex flex-col items-center gap-4" style={{ bottom: "calc(env(safe-area-inset-bottom) + 96px)" }}>
+        {primary && (
+          <button onClick={() => onOpenModel(primary)} aria-label={primary} className="mb-1 transition active:scale-90">
+            {avatar
+              ? <img src={mediaURL(avatar)} className="w-11 h-11 rounded-full object-cover ring-2 ring-white/90" />
+              : <span className="w-11 h-11 rounded-full bg-panel2 ring-2 ring-white/90 grid place-items-center text-white font-bold">{primary[0]?.toUpperCase()}</span>}
+          </button>
+        )}
+        <FeedAction icon={fav ? "heart-fill" : "heart"} active={fav} label={fav ? "Liked" : "Like"} onClick={() => like()} />
+        <FeedAction icon="bookmark" label="Save" onClick={() => setShowColl(true)} />
+        <FeedAction icon="tag" label="Tag" onClick={() => setShowLabels(true)} />
       </div>
 
-      <div className="absolute left-4 right-16 bottom-24 text-white cap">
-        {primary && <button onClick={() => onOpenModel(primary)} className="font-semibold text-white text-base">{primary}</button>}
-        <div className="text-sm text-white/90 line-clamp-2 mt-0.5">{v.title || v.uploader}</div>
+      <div className="absolute left-4 right-20 z-[51] text-white" style={{ bottom: "calc(env(safe-area-inset-bottom) + 44px)" }}>
+        {primary && <button onClick={() => onOpenModel(primary)} className="font-bold text-[15px] drop-shadow">{primary}</button>}
+        <div className="text-sm text-white/90 line-clamp-2 mt-0.5 drop-shadow">{v.title || v.uploader}</div>
         {v.labels && v.labels.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mt-2">
-            {v.labels.slice(0, 4).map((l) => <span key={l} className="text-[11px] bg-white/15 backdrop-blur px-2 py-0.5 rounded-full">{l}</span>)}
+            {v.labels.slice(0, 4).map((l) => <span key={l} className="text-[11px] bg-white/15 backdrop-blur-sm px-2 py-0.5 rounded-full">{l}</span>)}
           </div>
         )}
       </div>
+
+      {/* Thin scrubber pinned to the bottom of the active cell. */}
+      {active && (
+        <div className="absolute inset-x-0 bottom-0 z-[53]" style={{ touchAction: "none", height: 28, paddingBottom: "env(safe-area-inset-bottom)" }}
+          onPointerDown={(e) => { (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId); setScrubbing(true); seekTo(e.clientX); }}
+          onPointerMove={(e) => { if (scrubbing) seekTo(e.clientX); }}
+          onPointerUp={() => setScrubbing(false)} onPointerCancel={() => setScrubbing(false)}>
+          <div className="absolute inset-x-3 bottom-2">
+            <div className={`rounded-full bg-white/25 overflow-hidden transition-all ${scrubbing ? "h-[6px]" : "h-[3px]"}`}>
+              <div className="h-full bg-white rounded-full" style={{ width: `${prog * 100}%` }} />
+            </div>
+          </div>
+        </div>
+      )}
 
       {showColl && (
         <AddToCollectionModal refs={[{ site: v.site, id: v.id }]} collections={collections}

@@ -1,4 +1,4 @@
-// Command blushd is the headless Media Vault server: it runs the core
+// Command troved is the headless Trove server: it runs the core
 // engine and exposes the HTTP API, SSE events, range-served media, and the web
 // UI on one port — suitable for running on a NAS or any always-on machine.
 package main
@@ -12,16 +12,16 @@ import (
 	"os"
 	"time"
 
-	"blush/internal/core"
-	"blush/internal/server"
+	"trove/internal/core"
+	"trove/internal/server"
 )
 
 func main() {
-	// Subcommand: `blushd migrate-flat` converts the vault to the flat
+	// Subcommand: `troved migrate-flat` converts the vault to the flat
 	// media/ layout (dry run unless --apply). Stop the daemon before applying.
 	if len(os.Args) > 1 && os.Args[1] == "migrate-flat" {
 		fs := flag.NewFlagSet("migrate-flat", flag.ExitOnError)
-		root := fs.String("root", "", "media vault directory (else $MEDIAVAULT_ROOT, saved config, or a default under home)")
+		root := fs.String("root", "", "vault directory (else $TROVE_ROOT, saved config, or a default under home)")
 		apply := fs.Bool("apply", false, "execute the migration (default is a dry run that only writes a manifest)")
 		rollback := fs.String("rollback", "", "journal file from a previous --apply to roll back")
 		_ = fs.Parse(os.Args[2:])
@@ -32,7 +32,7 @@ func main() {
 	}
 
 	addr := flag.String("addr", ":8899", "listen address (e.g. 0.0.0.0:8899 to expose on the LAN). Avoid 8787 — Plex uses it.")
-	root := flag.String("root", "", "media vault directory (else $MEDIAVAULT_ROOT, saved config, or a default under home)")
+	root := flag.String("root", "", "vault directory (else $TROVE_ROOT, saved config, or a default under home)")
 	uiDir := flag.String("ui", "frontend/dist", "directory of the built web UI to serve (empty to disable)")
 	flag.Parse()
 
@@ -62,7 +62,7 @@ func main() {
 	}
 
 	srv := server.New(c, hub, ui)
-	log.Printf("blush.xxx daemon listening on %s  (vault: %s)", *addr, resolved)
+	log.Printf("trove daemon listening on %s  (vault: %s)", *addr, resolved)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}

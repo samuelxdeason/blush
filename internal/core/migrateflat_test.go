@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"blush/internal/library"
+	"trove/internal/library"
 )
 
 // buildLegacyVault creates a miniature pre-migration vault: a PornHub download
@@ -131,11 +131,11 @@ func TestFlatMigrationPlanApplyRollback(t *testing.T) {
 	checkContent(`media\pornhub-ph1.mp4`, "video-ph1")
 	checkContent(`media\local-abc123.mp4`, "video-local")
 	checkContent(`media\photo-def456.jpg`, "photo-bob")
-	checkContent(`.xxx\meta\pornhub-ph1.info.json`, `{"id":"ph1","extractor_key":"PornHub"}`)
-	checkContent(`.xxx\thumbs\pornhub-ph1.jpg`, "thumb-ph1")
+	checkContent(`.trove\meta\pornhub-ph1.info.json`, `{"id":"ph1","extractor_key":"PornHub"}`)
+	checkContent(`.trove\thumbs\pornhub-ph1.jpg`, "thumb-ph1")
 
 	// The Local video got a synthetic sidecar carrying its id.
-	scB, err := os.ReadFile(filepath.Join(root, `.xxx\meta\local-abc123.info.json`))
+	scB, err := os.ReadFile(filepath.Join(root, `.trove\meta\local-abc123.info.json`))
 	if err != nil {
 		t.Fatalf("synthetic sidecar: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestFlatMigrationPlanApplyRollback(t *testing.T) {
 	if fp := byID["ph1"].Filepath; fp != filepath.Join("media", "pornhub-ph1.mp4") {
 		t.Fatalf("ph1 filepath = %q", fp)
 	}
-	if th := byID["ph1"].Thumbnail; th != filepath.Join(".xxx", "thumbs", "pornhub-ph1.jpg") {
+	if th := byID["ph1"].Thumbnail; th != filepath.Join(".trove", "thumbs", "pornhub-ph1.jpg") {
 		t.Fatalf("ph1 thumbnail = %q", th)
 	}
 	if fp := byID["local_abc123"].Filepath; fp != filepath.Join("media", "local-abc123.mp4") {
@@ -216,7 +216,7 @@ func TestFlatMigrationPlanApplyRollback(t *testing.T) {
 	checkContent(`PornHub\Alice\Alice [ph1].jpg`, "thumb-ph1")
 	checkContent(`Local\Bob\clip.mp4`, "video-local")
 	checkContent(`Local\Bob\photos\pic.jpg`, "photo-bob")
-	if _, err := os.Stat(filepath.Join(root, `.xxx\meta\local-abc123.info.json`)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, `.trove\meta\local-abc123.info.json`)); !os.IsNotExist(err) {
 		t.Fatalf("synthetic sidecar should be removed on rollback, err=%v", err)
 	}
 	vids2, _ := db.RawVideos()
@@ -249,8 +249,8 @@ func TestFlatMigrationCrashResume(t *testing.T) {
 		}
 	}
 	mv(`PornHub\Alice\Alice [ph1].mp4`, `media\pornhub-ph1.mp4`)
-	mv(`PornHub\Alice\Alice [ph1].info.json`, `.xxx\meta\pornhub-ph1.info.json`)
-	mv(`PornHub\Alice\Alice [ph1].jpg`, `.xxx\thumbs\pornhub-ph1.jpg`)
+	mv(`PornHub\Alice\Alice [ph1].info.json`, `.trove\meta\pornhub-ph1.info.json`)
+	mv(`PornHub\Alice\Alice [ph1].jpg`, `.trove\thumbs\pornhub-ph1.jpg`)
 
 	plan, err := PlanFlatMigration(db, root)
 	if err != nil {

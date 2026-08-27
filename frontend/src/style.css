@@ -191,6 +191,16 @@ textarea:focus {
   contain: layout style;
 }
 
+/* Feed: double-tap heart burst. */
+@keyframes heartburst {
+  0% { opacity: 0; transform: scale(0.4) rotate(-8deg); }
+  20% { opacity: 1; transform: scale(1.15) rotate(3deg); }
+  35% { transform: scale(0.98) rotate(0); }
+  70% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.2) translateY(-30px); }
+}
+.heartburst { animation: heartburst 0.75s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+
 /* Page + element entrance motion. */
 @keyframes rise {
   from { opacity: 0; transform: translateY(10px); }

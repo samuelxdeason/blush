@@ -12,10 +12,10 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
-	"blush/internal/core"
-	"blush/internal/downloader"
-	"blush/internal/library"
-	"blush/internal/server"
+	"trove/internal/core"
+	"trove/internal/downloader"
+	"trove/internal/library"
+	"trove/internal/server"
 )
 
 // App is the thin desktop shell. The catalogue, downloads, and media serving all
@@ -68,7 +68,7 @@ func (a *App) APIBase() string { return a.apiBase }
 
 // ChooseMediaRoot opens a folder picker and saves the choice (next-launch).
 func (a *App) ChooseMediaRoot() string {
-	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{Title: "Choose your Media Vault folder"})
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{Title: "Choose your Trove folder"})
 	if err != nil || strings.TrimSpace(dir) == "" {
 		return a.mediaRot
 	}

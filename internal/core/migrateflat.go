@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"blush/internal/library"
+	"trove/internal/library"
 )
 
 // Flat-layout migration: moves every catalogued file from the legacy
 // <Site>/<Uploader>/ tree into <root>/media as "<site>-<id>.<ext>", parks
-// .info.json sidecars in .keepsake/meta and thumbnails in .keepsake/thumbs,
+// .info.json sidecars in .trove/meta and thumbnails in .trove/thumbs,
 // and rewrites the stored paths. Everything is a same-volume rename — no data
 // is copied and nothing is ever deleted. Each executed step is journaled so a
 // crashed run can re-run to completion (idempotent) or be rolled back.
@@ -552,7 +552,7 @@ func RollbackFlatMigration(db *library.DB, root, journalPath string, logf func(s
 	return nil
 }
 
-// RunFlatMigration is the CLI entry point behind `blushd migrate-flat`.
+// RunFlatMigration is the CLI entry point behind `troved migrate-flat`.
 // Dry run by default: prints the plan and writes a manifest. --apply executes;
 // --rollback replays a journal backwards.
 func RunFlatMigration(root string, apply bool, rollbackJournal string) error {
@@ -614,8 +614,8 @@ func RunFlatMigration(root string, apply bool, rollbackJournal string) error {
 	logf("applying…")
 	journal, err := ApplyFlatMigration(db, root, plan, logf)
 	if err != nil {
-		return fmt.Errorf("%w\nThe run is resumable: re-run `blushd migrate-flat --apply`, or roll back with --rollback %s", err, journal)
+		return fmt.Errorf("%w\nThe run is resumable: re-run `troved migrate-flat --apply`, or roll back with --rollback %s", err, journal)
 	}
-	logf("done. Roll back anytime with: blushd migrate-flat --rollback %s", journal)
+	logf("done. Roll back anytime with: troved migrate-flat --rollback %s", journal)
 	return nil
 }

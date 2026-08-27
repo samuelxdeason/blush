@@ -1,4 +1,4 @@
-// Package core is the host-independent engine of Media Vault: the catalogue,
+// Package core is the host-independent engine of Trove: the catalogue,
 // the download queue, media serving, and config. It has no dependency on Wails
 // or HTTP, so it can be driven by the desktop app, the headless daemon, or tests.
 package core
@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"blush/internal/downloader"
-	"blush/internal/library"
+	"trove/internal/downloader"
+	"trove/internal/library"
 )
 
 // Core holds the live engine: the catalogue DB and the download queue. Hosts
@@ -23,7 +23,7 @@ type Core struct {
 	db        *library.DB
 	dl        *downloader.Downloader
 	mediaRoot string
-	stateDir  string // .keepsake: catalogue, archive, cookies, caches (separate from media)
+	stateDir  string // .trove: catalogue, archive, cookies, caches (separate from media)
 	emit      func(event string, data any)
 
 	ogCache map[string]string
@@ -40,11 +40,11 @@ func New(mediaRoot string, emit func(event string, data any)) (*Core, error) {
 		return nil, err
 	}
 	// Move legacy state files (db/archive/cookies/cache) out of the media root and
-	// into .keepsake so the vault root holds only media. One-time + idempotent.
+	// into .trove so the vault root holds only media. One-time + idempotent.
 	migrateState(mediaRoot)
 	sdir := stateDir(mediaRoot)
 
-	// Pick the catalogue: prefer the migrated .keepsake copy, but fall back to a
+	// Pick the catalogue: prefer the migrated .trove copy, but fall back to a
 	// root-level db that couldn't be moved (e.g. still open by another instance)
 	// so we never fork a second, divergent catalogue. Paths stay RELATIVE to
 	// mediaRoot, so the db location doesn't affect how media resolves.
@@ -95,8 +95,8 @@ func (c *Core) Models() ([]library.Model, error)                    { return c.d
 func (c *Core) VideosByModel(model string) ([]library.Video, error) { return c.db.VideosByModel(model) }
 func (c *Core) VideosBySite(site string) ([]library.Video, error)   { return c.db.VideosBySite(site) }
 func (c *Core) Search(q string) ([]library.Video, error)            { return c.db.Search(q) }
-func (c *Core) AllVideos(limit, offset int, sort, site string, fav bool) ([]library.Video, error) {
-	return c.db.AllVideos(limit, offset, sort, site, fav)
+func (c *Core) AllVideos(limit, offset int, sort, site string, fav bool, seed int64) ([]library.Video, error) {
+	return c.db.AllVideos(limit, offset, sort, site, fav, seed)
 }
 func (c *Core) RecentlyDownloaded() ([]library.Video, error)        { return c.db.RecentlyDownloaded(200) }
 func (c *Core) RecentlyWatched() ([]library.Video, error)           { return c.db.RecentlyWatched(200) }
@@ -171,7 +171,7 @@ func (c *Core) SetCookieSpec(spec string)                            { c.dl.SetC
 // Import copies local files/folders into the library under model.
 func (c *Core) Import(paths []string, model string) { c.dl.Import(paths, model) }
 
-// BackupCatalogue checkpoints and copies the catalogue db to .keepsake/backups
+// BackupCatalogue checkpoints and copies the catalogue db to .trove/backups
 // with a timestamped name, returning the backup path. Your media isn't touched.
 func (c *Core) BackupCatalogue() (string, error) {
 	_ = c.db.Checkpoint()
@@ -243,22 +243,23 @@ func ffmpegDir() string {
 
 // ---- config ------------------------------------------------------------
 
-const defaultRootName = "MediaVault"
+const defaultRootName = "Trove"
 
 // stateDirName is the hidden subfolder holding app state (catalogue, archive,
 // cookies, caches) so the vault root contains only media folders.
-const stateDirName = ".xxx"
+const stateDirName = ".trove"
 
-// legacyStateDirName is the state folder's pre-rename name (Keepsake era);
-// migrateState renames it in place on first launch after the update.
-const legacyStateDirName = ".keepsake"
+// legacyStateDirNames are the state folder's pre-rename names (Keepsake and
+// blush.xxx eras); migrateState renames the first one found in place on the
+// first launch after the update.
+var legacyStateDirNames = []string{".xxx", ".keepsake"}
 
 func stateDir(mediaRoot string) string { return filepath.Join(mediaRoot, stateDirName) }
 
 func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
 // resolveDBPath returns the catalogue path to open and whether this is a fresh
-// install. It prefers the migrated .keepsake copy; if the db is still at the
+// install. It prefers the migrated .trove copy; if the db is still at the
 // root (migrateState couldn't move it because another instance holds it open),
 // it opens that same file in place rather than creating a divergent second
 // catalogue. freshInstall is true only when no db exists at either location.
@@ -276,17 +277,20 @@ func resolveDBPath(mediaRoot, sdir string) (path string, freshInstall bool) {
 }
 
 // migrateState moves the state files that used to sit in the media root into
-// .keepsake. It runs once: on later launches the files are already there and
+// .trove. It runs once: on later launches the files are already there and
 // it's a no-op. Media files are never touched. WAL/SHM sidecars move with the
 // db so SQLite can still recover an unflushed write-ahead log.
 func migrateState(mediaRoot string) {
 	dir := stateDir(mediaRoot)
-	// One-time: the whole state dir was renamed .keepsake -> .xxx with the app.
-	// Rename it wholesale (db, wal, archive, meta/, thumbs/ all come along);
-	// stored .keepsake\ paths are rewritten by library.Open.
+	// One-time: the state dir has been renamed with the app (.keepsake -> .xxx
+	// -> .trove). Rename it wholesale (db, wal, archive, meta/, thumbs/ all come
+	// along); stored legacy-prefix paths are rewritten by library.Open.
 	if _, err := os.Stat(dir); err != nil {
-		if oldDir := filepath.Join(mediaRoot, legacyStateDirName); fileExists(oldDir) {
-			_ = os.Rename(oldDir, dir)
+		for _, legacy := range legacyStateDirNames {
+			if oldDir := filepath.Join(mediaRoot, legacy); fileExists(oldDir) {
+				_ = os.Rename(oldDir, dir)
+				break
+			}
 		}
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -317,20 +321,37 @@ func configPath() string {
 	if err != nil || dir == "" {
 		dir = "."
 	}
+	return filepath.Join(dir, "Trove", "config.json")
+}
+
+// legacyConfigPath is where the pre-rename app (MediaVault/blush era) kept its
+// config; ResolveRoot falls back to it until a SaveRoot writes the new file.
+func legacyConfigPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil || dir == "" {
+		dir = "."
+	}
 	return filepath.Join(dir, "MediaVault", "config.json")
 }
 
-// ResolveRoot picks the media root: explicit override wins, then $MEDIAVAULT_ROOT,
-// then the saved config, then a per-OS default under the user's home.
+// ResolveRoot picks the media root: explicit override wins, then $TROVE_ROOT
+// (or the legacy $MEDIAVAULT_ROOT), then the saved config, then a per-OS
+// default under the user's home.
 func ResolveRoot(override string) string {
 	if strings.TrimSpace(override) != "" {
 		return override
 	}
-	if env := strings.TrimSpace(os.Getenv("MEDIAVAULT_ROOT")); env != "" {
-		return env
+	for _, key := range []string{"TROVE_ROOT", "MEDIAVAULT_ROOT"} {
+		if env := strings.TrimSpace(os.Getenv(key)); env != "" {
+			return env
+		}
 	}
 	var c appConfig
-	if data, err := os.ReadFile(configPath()); err == nil {
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		data, err = os.ReadFile(legacyConfigPath())
+	}
+	if err == nil {
 		_ = json.Unmarshal(data, &c)
 	}
 	if strings.TrimSpace(c.MediaRoot) != "" {

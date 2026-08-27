@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"blush/internal/core"
-	"blush/internal/library"
+	"trove/internal/core"
+	"trove/internal/library"
 )
 
 // Server wires the core engine and the event hub onto an http.Handler.
@@ -74,7 +74,7 @@ func (s *Server) routes(ui fs.FS) {
 		if limit <= 0 || limit > 500 {
 			limit = 200
 		}
-		return s.core.AllVideos(limit, int(qInt(r, "offset")), q(r, "sort"), q(r, "site"), q(r, "fav") == "1")
+		return s.core.AllVideos(limit, int(qInt(r, "offset")), q(r, "sort"), q(r, "site"), q(r, "fav") == "1", qInt(r, "seed"))
 	}))
 	m.HandleFunc("GET /api/videos/by-model", j(func(r *http.Request) (any, error) { return s.core.VideosByModel(q(r, "model")) }))
 	m.HandleFunc("GET /api/videos/by-site", j(func(r *http.Request) (any, error) { return s.core.VideosBySite(q(r, "site")) }))

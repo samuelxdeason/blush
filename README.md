@@ -1,20 +1,18 @@
-# README
+# trove
 
-## About
+Self-hosted library for media you save from anywhere. A headless Go server
+(`troved`) owns the catalogue and serves the HTTP API, SSE events, media, and
+the web UI (installable as a PWA); the Wails desktop app is a thin client over
+the same engine.
 
-This is the official Wails React-TS template.
+## Running
 
-You can configure the project by editing `wails.json`. More information about the project settings can be found
-here: https://wails.io/docs/reference/project-config
+- **Server:** `go build -o troved.exe ./cmd/troved`, then `troved -addr 0.0.0.0:8899 -ui frontend/dist`
+  (or use `start-trove.cmd`, which prints your LAN URL for phones).
+- **Desktop app:** `wails dev` for live development, `wails build` for a
+  redistributable build (see `wails.json`).
 
-## Live Development
-
-To run in live development mode, run `wails dev` in the project directory. This will run a Vite development
-server that will provide very fast hot reload of your frontend changes. If you want to develop in a browser
-and have access to your Go methods, there is also a dev server that runs on http://localhost:34115. Connect
-to this in your browser, and you can call your Go code from devtools.
-
-## Building
-
-To build a redistributable, production mode package, use `wails build`.
-# media-vault
+The vault location comes from `-root`, `$TROVE_ROOT`, or the saved config
+(`%APPDATA%\Trove\config.json`). App state (catalogue db, sidecars, thumbs)
+lives in a hidden `.trove/` folder inside the vault; media files live under
+`media/`.

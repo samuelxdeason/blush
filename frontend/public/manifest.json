@@ -1,6 +1,6 @@
 {
-  "name": "blush.xxx",
-  "short_name": "blush.xxx",
+  "name": "trove",
+  "short_name": "trove",
   "description": "Your private, self-hosted media library.",
   "start_url": "/",
   "scope": "/",

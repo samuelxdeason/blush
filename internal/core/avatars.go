@@ -15,7 +15,7 @@ import (
 // avatarsDir holds model profile pictures, kept with the rest of the vault state.
 func (c *Core) avatarsDir() string { return filepath.Join(c.stateDir, "avatars") }
 
-// saveAvatar writes image bytes into .keepsake/avatars and points the model's
+// saveAvatar writes image bytes into .trove/avatars and points the model's
 // cover at them. The filename carries a timestamp so the path changes on every
 // update — otherwise the browser's immutable image cache would show the old one.
 func (c *Core) saveAvatar(name string, data []byte, ext string) error {

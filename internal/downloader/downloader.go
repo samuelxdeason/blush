@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"blush/internal/library"
+	"trove/internal/library"
 )
 
 // Job is one queued download, as shown in the UI.
@@ -41,7 +41,7 @@ type Config struct {
 	YtDlp      string
 	FfmpegDir  string
 	MediaRoot  string
-	StateDir   string // .keepsake: where the sync cache (and other state) lives
+	StateDir   string // .trove: where the sync cache (and other state) lives
 	Archive    string
 	CookieSpec string // "" | "browser:<name>" | "file:<path>"
 }
@@ -540,7 +540,7 @@ func (d *Downloader) run(j *Job) {
 
 	// Flat layout: files land directly in media/ named by source+id (pure
 	// machine identity — models/titles live only in the catalogue). ingest
-	// canonicalises the name and parks the sidecars under .keepsake after
+	// canonicalises the name and parks the sidecars under .trove after
 	// the download finishes.
 	outtmpl := filepath.Join(cfg.MediaRoot, library.MediaDirName,
 		"%(extractor_key)s-%(id)s.%(ext)s")
@@ -795,7 +795,7 @@ func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
 // ingest reads the sidecar metadata for a downloaded file and stores it. The
 // sidecar sits beside the file (fresh download, legacy tree) or under
-// .keepsake/meta (flat layout).
+// .trove/meta (flat layout).
 func (d *Downloader) ingest(filepathStr string) (library.Video, bool) {
 	stem := strings.TrimSuffix(filepathStr, filepath.Ext(filepathStr))
 	sidecar := stem + ".info.json"
@@ -872,8 +872,8 @@ func (d *Downloader) ingestFrom(filepathStr, sidecar string) (library.Video, boo
 
 // canonicalizeFlat finalises a file living in media/: renames it to the
 // canonical "<site>-<id>.<ext>" (yt-dlp's own naming can differ in case or
-// sanitisation), moves the .info.json to .keepsake/meta and the thumbnail to
-// .keepsake/thumbs, and returns the final video + thumbnail paths.
+// sanitisation), moves the .info.json to .trove/meta and the thumbnail to
+// .trove/thumbs, and returns the final video + thumbnail paths.
 func (d *Downloader) canonicalizeFlat(fp, sidecar string, info ytInfo) (video, thumb string) {
 	origStem := strings.TrimSuffix(fp, filepath.Ext(fp))
 	ext := strings.ToLower(filepath.Ext(fp))
@@ -1259,7 +1259,7 @@ func (d *Downloader) RebuildFromDisk() (int, error) {
 	n := 0
 	sep := string(filepath.Separator)
 
-	// 0) Flat layout: sidecars live in .keepsake/meta, media in media/. This
+	// 0) Flat layout: sidecars live in .trove/meta, media in media/. This
 	// covers everything the flat migration (or a post-migration download or
 	// import) produced — including Local files via their synthetic sidecars.
 	if entries, err := os.ReadDir(d.metaDir()); err == nil {
@@ -1284,7 +1284,7 @@ func (d *Downloader) RebuildFromDisk() (int, error) {
 			return nil
 		}
 		if e.IsDir() {
-			if e.Name() == stateDirBase { // skip .keepsake
+			if e.Name() == stateDirBase { // skip .trove
 				return fs.SkipDir
 			}
 			return nil
@@ -1341,8 +1341,8 @@ func (d *Downloader) RebuildFromDisk() (int, error) {
 	return n, nil
 }
 
-// stateDirBase mirrors core's .xxx state folder name so a rebuild scan skips it.
-const stateDirBase = ".xxx"
+// stateDirBase mirrors core's .trove state folder name so a rebuild scan skips it.
+const stateDirBase = ".trove"
 
 // findMediaFile returns the video file sharing stem (the part before .info.json).
 func findMediaFile(stem string) string {

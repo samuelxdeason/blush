@@ -1,4 +1,4 @@
-module blush
+module trove
 
 go 1.25.0
 
