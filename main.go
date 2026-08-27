@@ -17,7 +17,7 @@ func main() {
 
 	// Create application with options
 	err := wails.Run(&options.App{
-		Title:     "nudes.xxx",
+		Title:     "blush.xxx",
 		Width:     1280,
 		Height:    860,
 		MinWidth:  900,

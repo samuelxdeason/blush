@@ -62,7 +62,7 @@ func main() {
 	}
 
 	srv := server.New(c, hub, ui)
-	log.Printf("nudes.xxx daemon listening on %s  (vault: %s)", *addr, resolved)
+	log.Printf("blush.xxx daemon listening on %s  (vault: %s)", *addr, resolved)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}
