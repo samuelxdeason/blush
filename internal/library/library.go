@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -22,7 +23,10 @@ type Video struct {
 	Site         string   `json:"site"`
 	Title        string   `json:"title"`
 	Uploader     string   `json:"uploader"`
+	UploaderID   string   `json:"uploader_id"` // platform's canonical account id (e.g. "pornstar/arabella-rose")
+	Cast         []string `json:"cast"`        // platform-asserted cast members (Pornhub)
 	Models       []string `json:"models"` // editable grouping(s); empty = Unassigned
+	Featured     []string `json:"featured"` // people who APPEAR in it but didn't upload it
 	Duration     *int     `json:"duration"`
 	Width        *int     `json:"width"`
 	Height       *int     `json:"height"`
@@ -196,6 +200,15 @@ func Open(path, root string) (*DB, error) {
 	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN position REAL`)
 	_, _ = sqlDB.Exec(`ALTER TABLE model_info ADD COLUMN nickname TEXT`)
 	_, _ = sqlDB.Exec(`ALTER TABLE photos ADD COLUMN album TEXT`)
+	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN featured TEXT`)
+	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN uploader_id TEXT`)
+	_, _ = sqlDB.Exec(`ALTER TABLE videos ADD COLUMN cast TEXT`)
+	if _, err := sqlDB.Exec(accountsSchema); err != nil {
+		return nil, fmt.Errorf("accounts schema: %w", err)
+	}
+	if _, err := sqlDB.Exec(savedConfirmedSchema); err != nil {
+		return nil, fmt.Errorf("saved_confirmed schema: %w", err)
+	}
 	// Backfill: existing rows adopt their uploader as the model (one-time; only
 	// touches rows where model is still NULL, i.e. right after the column is added).
 	_, _ = sqlDB.Exec(`UPDATE videos SET model = uploader WHERE model IS NULL`)
@@ -322,24 +335,43 @@ func jsonArr(a []string) string {
 
 // Upsert inserts or replaces a video (keyed by site+id).
 func (db *DB) Upsert(v Video) error {
+	// Verified-account attribution: an unassigned video whose source account
+	// is claimed by a person's profile link belongs to that person, not
+	// Unsorted. (Existing rows keep their model — see ON CONFLICT below.)
+	db.upsertVideoAccounts(v) // record the platform-asserted identities
+	// Cast-connected people are auto-featured — platform-asserted, no prompt.
+	for _, member := range v.Cast {
+		if p, ok := db.accountPerson(Account{Platform: "pornhub", Handle: HandleSlug(member)}); ok &&
+			!containsFold(v.Models, p) && !containsFold(v.Featured, p) {
+			v.Featured = append(v.Featured, p)
+		}
+	}
+	if len(v.Models) == 0 {
+		if acct, ok := videoAccount(v); ok {
+			if owner, found := db.AccountOwner(acct); found {
+				v.Models = []string{owner}
+			}
+		}
+	}
 	// favorite + labels are user data: set on first insert, never overwritten on
 	// re-download (no entry in the ON CONFLICT SET).
 	_, err := db.sql.Exec(`
 INSERT INTO videos (id,site,title,uploader,model,duration,width,height,ext,filepath,filename,
   thumbnail,thumbnail_url,webpage_url,upload_date,view_count,like_count,tags,categories,
-  description,filesize,added,favorite,labels)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  description,filesize,added,favorite,labels,featured,uploader_id,cast)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(site,id) DO UPDATE SET
   title=excluded.title, uploader=excluded.uploader, duration=excluded.duration,
   width=excluded.width, height=excluded.height, ext=excluded.ext, filepath=excluded.filepath,
   filename=excluded.filename, thumbnail=excluded.thumbnail, thumbnail_url=excluded.thumbnail_url,
   webpage_url=excluded.webpage_url, upload_date=excluded.upload_date, view_count=excluded.view_count,
   like_count=excluded.like_count, tags=excluded.tags, categories=excluded.categories,
-  description=excluded.description, filesize=excluded.filesize, added=excluded.added`,
+  description=excluded.description, filesize=excluded.filesize, added=excluded.added,
+  uploader_id=excluded.uploader_id, cast=excluded.cast`,
 		v.ID, v.Site, v.Title, v.Uploader, jsonArr(v.Models), ptr(v.Duration), ptr(v.Width), ptr(v.Height),
 		v.Ext, db.rel(v.Filepath), v.Filename, db.rel(v.Thumbnail), v.ThumbnailURL, v.WebpageURL,
 		v.UploadDate, ptr(v.ViewCount), ptr(v.LikeCount), jsonArr(v.Tags),
-		jsonArr(v.Categories), v.Description, ptr(v.Filesize), v.Added, b2i(v.Favorite), jsonArr(v.Labels))
+		jsonArr(v.Categories), v.Description, ptr(v.Filesize), v.Added, b2i(v.Favorite), jsonArr(v.Labels), jsonArr(v.Featured), v.UploaderID, jsonArr(v.Cast))
 	return err
 }
 
@@ -536,6 +568,200 @@ func (db *DB) SetModelCover(name, coverAbs string) error {
 	_, err := db.sql.Exec(`UPDATE model_info SET cover=?, updated=? WHERE name=?`,
 		db.rel(coverAbs), time.Now().Format("2006-01-02 15:04:05"), name)
 	return err
+}
+
+// ---- verified platform accounts -----------------------------------------
+//
+// A profile link to a platform account is treated as a verified claim of
+// ownership: videos downloaded FROM that account belong to that person.
+// Manually assigning a video to a person implies nothing about the account
+// that posted it (reposts are everywhere) — attribution only ever flows from
+// explicitly saved links.
+
+// Account is a platform identity claimed by a profile link.
+type Account struct {
+	Platform string `json:"platform"` // "x" | "pornhub"
+	Handle   string `json:"handle"`
+}
+
+// xHandleRe pulls the handle out of an X/Twitter URL.
+var xHandleRe = regexp.MustCompile(`(?i)(?:twitter\.com|x\.com)/@?([A-Za-z0-9_]{1,15})(?:[/?#]|$)`)
+
+// xReserved are twitter.com/<seg> paths that are site pages, not handles.
+var xReserved = map[string]bool{
+	"i": true, "home": true, "search": true, "explore": true, "hashtag": true,
+	"intent": true, "share": true, "settings": true, "messages": true, "notifications": true,
+}
+
+// phAccountRe matches Pornhub pornstar/model/channel/user profile URLs.
+var phAccountRe = regexp.MustCompile(`(?i)pornhub\.com/(?:pornstar|model|channels?|users)/([A-Za-z0-9_-]+)`)
+
+// XHandleFromURL extracts a lowercased X/Twitter handle from a URL ("" if none).
+func XHandleFromURL(u string) string {
+	m := xHandleRe.FindStringSubmatch(u)
+	if m == nil {
+		return ""
+	}
+	h := strings.ToLower(m[1])
+	if xReserved[h] {
+		return ""
+	}
+	return h
+}
+
+// AccountFromURL recognises a platform-account URL in a profile link.
+func AccountFromURL(u string) (Account, bool) {
+	if h := XHandleFromURL(u); h != "" {
+		return Account{Platform: "x", Handle: h}, true
+	}
+	if m := phAccountRe.FindStringSubmatch(u); m != nil {
+		return Account{Platform: "pornhub", Handle: strings.ToLower(m[1])}, true
+	}
+	for _, p := range []struct{ platform string; re *regexp.Regexp }{
+		{"onlyfans", ofAccountRe}, {"fansly", fanslyAccountRe}, {"redgifs", rgAccountRe},
+	} {
+		if m := p.re.FindStringSubmatch(u); m != nil {
+			return Account{Platform: p.platform, Handle: strings.ToLower(m[1])}, true
+		}
+	}
+	return Account{}, false
+}
+
+var ofAccountRe = regexp.MustCompile(`(?i)onlyfans\.com/@?([A-Za-z0-9_.-]+)`)
+var fanslyAccountRe = regexp.MustCompile(`(?i)fansly\.com/@?([A-Za-z0-9_.-]+)`)
+var rgAccountRe = regexp.MustCompile(`(?i)redgifs\.com/users/([A-Za-z0-9_.-]+)`)
+
+// HandleSlug normalises a display name the way Pornhub slugs handles
+// ("Emma Hix" -> "emma-hix") so uploader names compare against profile URLs.
+func HandleSlug(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		case r == ' ' || r == '-' || r == '_':
+			b.WriteRune('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// videoAccount derives the account a video was downloaded from ("", false when
+// the site has no account notion we understand).
+func videoAccount(v Video) (Account, bool) {
+	switch {
+	case strings.EqualFold(v.Site, "Twitter"):
+		if h := XHandleFromURL(v.WebpageURL); h != "" {
+			return Account{Platform: "x", Handle: h}, true
+		}
+	case strings.EqualFold(v.Site, "PornHub"):
+		if _, h := ParsePHUploaderID(v.UploaderID); h != "" {
+			return Account{Platform: "pornhub", Handle: h}, true
+		}
+		if h := HandleSlug(v.Uploader); h != "" {
+			return Account{Platform: "pornhub", Handle: h}, true
+		}
+	}
+	return Account{}, false
+}
+
+// AccountOwner returns the person whose saved profile links claim this account.
+func (db *DB) AccountOwner(a Account) (string, bool) {
+	if a.Handle == "" {
+		return "", false
+	}
+	rows, err := db.sql.Query(`SELECT name, COALESCE(links,'') FROM model_info WHERE links IS NOT NULL AND links<>''`)
+	if err != nil {
+		return "", false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, raw string
+		if rows.Scan(&name, &raw) != nil {
+			continue
+		}
+		var links []ModelLink
+		_ = json.Unmarshal([]byte(raw), &links)
+		for _, l := range links {
+			if got, ok := AccountFromURL(l.URL); ok && got == a {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
+const unsorted = `(model IS NULL OR model='' OR model='[]')`
+
+// UnsortedFromAccount returns Unsorted videos downloaded from the account.
+func (db *DB) UnsortedFromAccount(a Account) ([]Video, error) {
+	if a.Handle == "" {
+		return nil, nil
+	}
+	var cand []Video
+	var err error
+	switch a.Platform {
+	case "x":
+		cand, err = db.query(`WHERE site='Twitter' AND `+unsorted+
+			` AND webpage_url LIKE '%/' || ? || '/status/%' COLLATE NOCASE ORDER BY added DESC LIMIT 2000`, a.Handle)
+	case "pornhub":
+		cand, err = db.query(`WHERE site='PornHub' AND ` + unsorted + ` ORDER BY added DESC LIMIT 2000`)
+	default:
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := cand[:0]
+	for _, v := range cand {
+		if got, ok := videoAccount(v); ok && got == a {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+// AssignAccount assigns person to every Unsorted video from the account.
+func (db *DB) AssignAccount(a Account, person string) (int, error) {
+	vids, err := db.UnsortedFromAccount(a)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, v := range vids {
+		if err := db.SetModels(v.Site, v.ID, []string{person}); err == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// ---- featured (appears-in, separate from uploader/collection) -----------
+
+// SetFeatured replaces the people who appear in (but didn't upload) a video.
+func (db *DB) SetFeatured(site, id string, people []string) error {
+	_, err := db.sql.Exec(`UPDATE videos SET featured=? WHERE site=? AND id=?`, jsonArr(people), site, id)
+	return err
+}
+
+// AddFeatured adds one person to a video's appears-in set (no duplicates).
+func (db *DB) AddFeatured(site, id, person string) error {
+	vids, err := db.query(`WHERE site=? AND id=?`, site, id)
+	if err != nil || len(vids) == 0 {
+		return err
+	}
+	for _, f := range vids[0].Featured {
+		if strings.EqualFold(f, person) {
+			return nil
+		}
+	}
+	return db.SetFeatured(site, id, append(vids[0].Featured, person))
+}
+
+// VideosFeaturing returns videos a person appears in but didn't upload.
+func (db *DB) VideosFeaturing(person string) ([]Video, error) {
+	b, _ := json.Marshal(person)
+	return db.query(`WHERE featured LIKE ? AND `+notHidden+` ORDER BY added DESC, id`, "%"+string(b)+"%")
 }
 
 // SetModels reassigns a video's model set (empty = Unassigned).
@@ -788,7 +1014,7 @@ const cols = `videos.id,videos.site,videos.title,videos.uploader,videos.model,vi
 	`videos.width,videos.height,videos.ext,videos.filepath,videos.filename,videos.thumbnail,` +
 	`videos.thumbnail_url,videos.webpage_url,videos.upload_date,videos.view_count,videos.like_count,` +
 	`videos.tags,videos.categories,videos.description,videos.filesize,videos.added,videos.watched_at,` +
-	`videos.favorite,videos.labels,videos.position`
+	`videos.favorite,videos.labels,videos.position,videos.featured,videos.uploader_id,videos.cast`
 
 // notHidden is true for a video that is NOT a member of any hidden collection.
 // Default views AND this in so hidden content (e.g. an adult collection) stays
@@ -811,15 +1037,18 @@ func scanVideo(rows *sql.Rows) (Video, error) {
 	var dur, w, h, vc, lc, fs sql.NullInt64
 	var tags, cats string
 	var watched sql.NullString
-	var model, labels sql.NullString
+	var model, labels, featured, uploaderID, cast sql.NullString
 	var fav sql.NullInt64
 	var pos sql.NullFloat64
 	if err := rows.Scan(&v.ID, &v.Site, &v.Title, &v.Uploader, &model, &dur, &w, &h, &v.Ext,
 		&v.Filepath, &v.Filename, &v.Thumbnail, &v.ThumbnailURL, &v.WebpageURL,
-		&v.UploadDate, &vc, &lc, &tags, &cats, &v.Description, &fs, &v.Added, &watched, &fav, &labels, &pos); err != nil {
+		&v.UploadDate, &vc, &lc, &tags, &cats, &v.Description, &fs, &v.Added, &watched, &fav, &labels, &pos, &featured, &uploaderID, &cast); err != nil {
 		return v, err
 	}
 	v.Models = parseModels(model.String)
+	v.Featured = parseModels(featured.String)
+	v.UploaderID = uploaderID.String
+	v.Cast = parseModels(cast.String)
 	v.Favorite = fav.Int64 == 1
 	if pos.Valid {
 		v.Position = &pos.Float64

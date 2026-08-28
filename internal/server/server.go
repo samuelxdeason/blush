@@ -125,6 +125,36 @@ func (s *Server) routes(ui fs.FS) {
 	post(m, "/api/setlabels", func(b body) (any, error) { return ok, s.core.SetLabels(b.Site, b.ID, b.Labels) })
 	post(m, "/api/savemodelinfo", func(b body) (any, error) { return ok, s.core.SaveModelInfo(b.Name, b.Nickname, b.Bio, b.Links) })
 	post(m, "/api/model/rename", func(b body) (any, error) { return ok, s.core.RenameModel(b.Name, b.NewName) })
+	m.HandleFunc("GET /api/model/accountmatches", j(func(r *http.Request) (any, error) { return s.core.AccountMatches(q(r, "name")) }))
+	post(m, "/api/model/claimaccount", func(b body) (any, error) {
+		n, err := s.core.ClaimAccount(b.Name, b.Platform, b.Handle)
+		return map[string]int{"assigned": n}, err
+	})
+	m.HandleFunc("GET /api/videos/featuring", j(func(r *http.Request) (any, error) { return s.core.VideosFeaturing(q(r, "model")) }))
+	m.HandleFunc("GET /api/model/castsuggestions", j(func(r *http.Request) (any, error) { return s.core.CastSuggestions(q(r, "name")) }))
+	post(m, "/api/setfeatured", func(b body) (any, error) { return ok, s.core.SetFeatured(b.Site, b.ID, b.Featured) })
+	post(m, "/api/model/acceptcast", func(b body) (any, error) { return ok, s.core.AddFeatured(b.Site, b.ID, b.Name) })
+	m.HandleFunc("GET /api/accounts", j(func(r *http.Request) (any, error) {
+		if q(r, "counts") == "1" {
+			return s.core.AccountsWithCounts()
+		}
+		return s.core.Accounts()
+	}))
+	m.HandleFunc("GET /api/videos/uploads", j(func(r *http.Request) (any, error) { return s.core.VideosUploadedBy(q(r, "name")) }))
+	m.HandleFunc("GET /api/videos/saved", j(func(r *http.Request) (any, error) { return s.core.VideosSavedBy(q(r, "name")) }))
+	m.HandleFunc("GET /api/accounts/for-person", j(func(r *http.Request) (any, error) { return s.core.AccountsForPerson(q(r, "name")) }))
+	post(m, "/api/accounts/connect", func(b body) (any, error) { return ok, s.core.ConnectAccount(b.Platform, b.Handle, b.Name) })
+	post(m, "/api/accounts/create", func(b body) (any, error) {
+		return ok, s.core.CreateAccount(library.AccountInfo{Platform: b.Platform, Handle: b.Handle, URL: b.URL, Person: b.Name})
+	})
+	post(m, "/api/accounts/adopt", func(b body) (any, error) { return s.core.AdoptAccount(b.Platform, b.Handle, b.Name) })
+	post(m, "/api/maintenance/backfill-accounts", func(_ body) (any, error) { return s.core.BackfillAccounts() })
+	m.HandleFunc("GET /api/maintenance/reinterpret", j(func(_ *http.Request) (any, error) { return s.core.ReinterpretPlan() }))
+	post(m, "/api/maintenance/reinterpret/apply", func(_ body) (any, error) { return s.core.ReinterpretApply() })
+	post(m, "/api/maintenance/reinterpret/keep", func(b body) (any, error) { return ok, s.core.ConfirmSaved(b.Site, b.ID, b.Name) })
+	post(m, "/api/maintenance/reinterpret/tofeatured", func(b body) (any, error) {
+		return ok, s.core.DemoteToFeatured(b.Site, b.ID, b.Name)
+	})
 	post(m, "/api/photos/from-url", func(b body) (any, error) { s.core.ImportPhotosFromURL(b.URL, b.Model, b.Name); return ok, nil })
 
 	// --- ingestion (external fetcher catalogues files it placed in the vault) ---
@@ -221,6 +251,9 @@ type body struct {
 	Links   []library.ModelLink `json:"links"`
 	Nickname string             `json:"nickname"`
 	NewName  string             `json:"newName"`
+	Handle   string             `json:"handle"`
+	Platform string             `json:"platform"`
+	Featured []string           `json:"featured"`
 }
 
 var ok = map[string]bool{"ok": true}

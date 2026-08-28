@@ -262,7 +262,10 @@ export namespace library {
 	    site: string;
 	    title: string;
 	    uploader: string;
+	    uploader_id: string;
+	    cast: string[];
 	    models: string[];
+	    featured: string[];
 	    duration?: number;
 	    width?: number;
 	    height?: number;
@@ -295,7 +298,10 @@ export namespace library {
 	        this.site = source["site"];
 	        this.title = source["title"];
 	        this.uploader = source["uploader"];
+	        this.uploader_id = source["uploader_id"];
+	        this.cast = source["cast"];
 	        this.models = source["models"];
+	        this.featured = source["featured"];
 	        this.duration = source["duration"];
 	        this.width = source["width"];
 	        this.height = source["height"];

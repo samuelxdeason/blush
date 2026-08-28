@@ -11,7 +11,8 @@ import {
   DeleteCollection, AddToCollection, RemoveFromCollection, VideosByCollection, CollectionsForVideo,
   EventsOn, BrowserOpenURL,
 } from "./api";
-import type { SyncSummary } from "./api";
+import { AccountMatches, ClaimAccount, SetFeatured, VideosFeaturing, CastSuggestions, AcceptCast, GetReinterpretPlan, ApplyReinterpret, ReinterpretKeep, ReinterpretToFeatured, AccountsWithCounts, AccountsForPerson, ConnectAccount, CreateAccount, VideosUploadedBy, VideosSavedBy, AllAccounts, AdoptAccount } from "./api";
+import type { SyncSummary, AccountMatch, ReinterpretPlan, ReinterpretAction, AccountInfo, AccountWithCount } from "./api";
 import { library, downloader } from "../wailsjs/go/models";
 
 type Model = library.Model;
@@ -31,6 +32,33 @@ const videoURL = (p?: string) => (p ? `${MEDIA_BASE}/media?p=${encodeURIComponen
 const SITE_LABEL: Record<string, string> = { Twitter: "X / Twitter", PornHub: "Pornhub" };
 const label = (s: string) => SITE_LABEL[s] || s;
 const UNASSIGNED = "Unsorted";
+// ACCTS maps "platform/handle" to the account row; refreshed with the model
+// list. It lets the UI resolve any video or cast entry to its account — and
+// know whether that account has a person parent yet.
+const ACCTS: Record<string, AccountInfo> = {};
+const acctKey = (platform: string, handle: string) => platform + "/" + handle;
+const phSlug = (s: string) =>
+  s.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/[ _]+/g, "-").replace(/^-+|-+$/g, "");
+// ownerAccountOf derives the platform account a video was downloaded from
+// (mirrors the server's videoAccount).
+function ownerAccountOf(v: Video): { platform: string; handle: string; display: string } | null {
+  if (v.site === "Twitter") {
+    const m = /(?:twitter|x)\.com\/@?([A-Za-z0-9_]{1,15})/i.exec(v.webpage_url || "");
+    return m ? { platform: "x", handle: m[1].toLowerCase(), display: v.uploader || m[1] } : null;
+  }
+  if (v.site === "PornHub") {
+    const raw = (v.uploader_id || "").toLowerCase().replace(/^\/+|\/+$/g, "");
+    const parts = raw.split("/").filter(Boolean);
+    const h = parts.length >= 2 ? parts[1] : parts[0] || phSlug(v.uploader || "");
+    return h ? { platform: "pornhub", handle: h, display: v.uploader || h } : null;
+  }
+  if (v.site === "RedGifs") {
+    const h = phSlug(v.uploader || "");
+    return h ? { platform: "redgifs", handle: h, display: v.uploader || h } : null;
+  }
+  return null;
+}
+
 // NICK maps a person's canonical name to their chosen nickname; refreshed
 // whenever the model list loads. modelLabel is THE way to render a name.
 const NICK: Record<string, string> = {};
@@ -190,6 +218,83 @@ function XLogo({ className = "" }: { className?: string }) {
   );
 }
 
+// PlatformLogo: brand marks for every platform we track accounts on.
+function PlatformLogo({ platform, size = "sm" }: { platform: string; size?: "xs" | "sm" }) {
+  const t = size === "xs" ? "text-[10px]" : "text-[12px]";
+  switch (platform) {
+    case "pornhub":
+      return <span className={`font-extrabold tracking-tight ${t}`}><span>Porn</span><span className="bg-[#ff9000] text-black rounded px-0.5">hub</span></span>;
+    case "x":
+      return <XLogo className={size === "xs" ? "w-3 h-3" : "w-3.5 h-3.5"} />;
+    case "onlyfans":
+      return <span className={`font-extrabold ${t}`} style={{ color: "#00AFF0" }}>OnlyFans</span>;
+    case "fansly":
+      return <span className={`font-extrabold ${t}`} style={{ color: "#2699F7" }}>Fansly</span>;
+    case "redgifs":
+      return <span className={`font-extrabold ${t}`}><span style={{ color: "#DD202C" }}>Red</span><span style={{ color: "#9A4DFF" }}>Gifs</span></span>;
+    default:
+      return <span className={`font-bold ${t}`}>{platform}</span>;
+  }
+}
+
+// AccountChip: an ACCOUNT, visually distinct from a person — platform logo +
+// @handle in a dashed chip. Persons get avatars and plain names; accounts
+// always look like this.
+function AccountChip({ platform, handle, onClick, size = "sm" }:
+  { platform: string; handle: string; onClick?: () => void; size?: "xs" | "sm" }) {
+  const pad = size === "xs" ? "px-2 py-0.5" : "px-2.5 py-1";
+  return (
+    <button onClick={onClick} disabled={!onClick}
+      className={`inline-flex items-center gap-1.5 rounded-lg border border-dashed border-fg/25 bg-panel2/70 ${pad} ${onClick ? "hover:border-accent transition" : ""}`}
+      title={`Account @${handle} — not linked to a person yet`}>
+      <PlatformLogo platform={platform} size={size} />
+      <span className={`${size === "xs" ? "text-[11px]" : "text-[12px]"} font-semibold text-fg/85`}>@{handle}</span>
+    </button>
+  );
+}
+
+// AccountActionModal: shown when an unparented account chip is clicked —
+// define a person for it (or connect an existing one) and everything the
+// account owns / appears in wires itself up.
+function AccountActionModal({ platform, handle, display, modelNames, onClose, onChanged }:
+  { platform: string; handle: string; display: string; modelNames: string[]; onClose: () => void; onChanged: () => void }) {
+  const [name, setName] = useState(display || handle);
+  const [busy, setBusy] = useState(false);
+  const acct = ACCTS[acctKey(platform, handle)];
+  const adopt = async () => {
+    const n = name.trim();
+    if (!n || busy) return;
+    setBusy(true);
+    try { await AdoptAccount(platform, handle, n); onChanged(); onClose(); } finally { setBusy(false); }
+  };
+  return (
+    <div className="fixed inset-0 bg-black/65 backdrop-blur-sm z-[80] grid place-items-center p-4" onClick={onClose}>
+      <div className="bg-panel border border-edge rounded-xl p-5 w-[92vw] max-w-[24rem] pop" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2 mb-1">
+          <PlatformLogo platform={platform} />
+          <span className="font-semibold">@{handle}</span>
+        </div>
+        <p className="text-xs text-muted mb-4">
+          This is an <b>account</b> — no person owns it yet. Give it a person and its videos
+          {acct?.url ? " " : " "}file themselves under them, now and for future downloads.
+        </p>
+        <label className="block text-xs text-muted mb-1">Person <span className="text-muted/60">(new name creates them)</span></label>
+        <input value={name} list="account-adopt-people" autoFocus onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") adopt(); }}
+          className="w-full bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent" />
+        <datalist id="account-adopt-people">{modelNames.map((n) => <option key={n} value={n} />)}</datalist>
+        <div className="flex items-center gap-2 mt-4">
+          {acct?.url && <button onClick={() => BrowserOpenURL(acct.url)} className="text-xs text-muted hover:text-fg">Open profile ↗</button>}
+          <span className="flex-1" />
+          <button onClick={onClose} className="text-sm text-muted hover:text-fg px-3 py-2">Cancel</button>
+          <button onClick={adopt} disabled={busy || !name.trim()} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+            className="text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50">{busy ? "Connecting…" : "Connect"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SourceBadge({ site, size = "sm" }: { site: string; size?: "xs" | "sm" | "lg" }) {
   const big = size === "lg";
   const text = size === "xs" ? "text-[10px]" : big ? "text-2xl" : "text-[13px]";
@@ -249,6 +354,10 @@ export default function App() {
       for (const x of m || []) if (x.nickname) NICK[x.name] = x.nickname;
       setModels(m || []);
     });
+    AllAccounts().then((as_) => {
+      for (const k of Object.keys(ACCTS)) delete ACCTS[k];
+      for (const ac of as_ || []) ACCTS[acctKey(ac.platform, ac.handle)] = ac;
+    }).catch(() => {});
     AllLabels().then((l) => setAllLabels(l || []));
     Collections().then((c) => setCollections(c || []));
     Stats().then((s) => setVideoTotal(s?.videoCount || 0));
@@ -378,22 +487,27 @@ export default function App() {
           : route.kind === "browse" ? <BrowseSync onEnqueued={() => go({ kind: "downloads" })} />
           : (
             <div className="p-4 md:p-6">
-              <div className="flex items-center flex-wrap gap-3 md:gap-4 mb-5">
-                {route.kind === "model" && <button onClick={() => go({ kind: "library" })} className="text-muted hover:text-fg text-sm">← People</button>}
+              <div className={`flex flex-wrap gap-3 md:gap-4 mb-5 ${route.kind === "library" ? "page-heading items-end" : "items-center"}`}>
+                {route.kind === "model" && <button onClick={() => go({ kind: "library" })} className="secondary-btn text-muted hover:text-fg text-xs font-bold px-2.5 py-1.5">← People</button>}
                 {["category", "categories", "recent", "watched", "favorites"].includes(route.kind) && (
                   <button onClick={() => go(route.kind === "category" ? { kind: "categories" } : { kind: "videos" })}
                     className="text-muted hover:text-fg text-sm">← {route.kind === "category" ? "Tags" : "Videos"}</button>
                 )}
-                <h1 className="text-xl font-bold flex items-center gap-2">
-                  {route.kind === "model" ? null
-                    : route.kind === "recent" ? "Latest"
-                    : route.kind === "watched" ? "History"
-                    : route.kind === "favorites" ? "Favorites"
-                    : route.kind === "categories" ? "Tags"
-                    : route.kind === "category" ? <><Icon name="tag" className="w-5 h-5 text-accent" />{route.label}</>
-                    : route.kind === "collection" ? null
-                    : "People"}
-                </h1>
+                {route.kind === "library"
+                  ? <div>
+                      <div className="eyebrow">People in your trove</div>
+                      <h1 className="page-title">People</h1>
+                    </div>
+                  : <h1 className="text-xl font-bold flex items-center gap-2">
+                      {route.kind === "model" ? null
+                        : route.kind === "recent" ? "Latest"
+                        : route.kind === "watched" ? "History"
+                        : route.kind === "favorites" ? "Favorites"
+                        : route.kind === "categories" ? "Tags"
+                        : route.kind === "category" ? <><Icon name="tag" className="w-5 h-5 text-accent" />{route.label}</>
+                        : route.kind === "collection" ? null
+                        : null}
+                    </h1>}
                 {["recent", "watched", "favorites", "category"].includes(route.kind) && videos.length > 0 && (
                   <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-accent/15 text-accent">{videos.length}</span>
                 )}
@@ -657,20 +771,20 @@ function VideosPage({ version, modelNames, collections, onPlay, onChanged, onOpe
   }, [vids, sort]);
 
   return (
-    <div className="p-4 md:p-6">
-      <div className="flex items-center gap-2.5 mb-2.5">
+    <div className="page-shell p-4 md:p-6">
+      <div className="page-heading flex items-end gap-3 mb-4">
         <div>
           <div className="eyebrow">Your private collection</div>
-          <h1 className="page-title text-xl font-bold">Videos</h1>
+          <h1 className="page-title">Videos</h1>
         </div>
         <select value={sort} onChange={(e) => pickSort(e.target.value)} aria-label="Sort"
-          className="ml-auto bg-panel border border-edge rounded-lg px-2.5 py-1.5 text-xs text-fg outline-none focus:border-accent">
+          className="control-select ml-auto">
           {VIDEO_SORTS.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
         </select>
       </div>
       {/* One scrollable strip: actions first, then filters — replaces the three
           stacked control rows that crowded the phone layout. */}
-      <div className="chipstrip flex items-center gap-2 mb-4 -mx-4 px-4 md:mx-0 md:px-0">
+      <div className="chipstrip page-toolbar flex items-center gap-2 mb-5 -mx-4 px-4 md:mx-0 md:px-0">
         <button onClick={() => vids.length && onPlay(vids[0], vids)}
           className="glow-btn px-3.5 py-1.5 text-xs whitespace-nowrap shrink-0">▶ Play all</button>
         <button onClick={() => { if (!vids.length) return; const v = vids[Math.floor(Math.random() * vids.length)]; onPlay(v, vids); }}
@@ -932,7 +1046,7 @@ function ModelGrid({ models, onOpen, onChanged }: { models: Model[]; onOpen: (m:
 
   return (
     <>
-      <div className="flex items-center gap-3 mb-3 text-sm">
+      <div className="video-toolbar flex items-center gap-3 mb-4 text-sm">
         {!selectMode
           ? <button onClick={() => setSelectMode(true)} className="text-muted hover:text-fg">Select</button>
           : <>
@@ -1139,12 +1253,32 @@ function ModelPage({ name, version, modelNames, onPlay, onChanged, onRenamed }:
   const [avatarOpen, setAvatarOpen] = useState(false);
   const [photoURL, setPhotoURL] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [acctMatches, setAcctMatches] = useState<AccountMatch[]>([]);
+  const [claiming, setClaiming] = useState(false);
+  const [featuring, setFeaturing] = useState<Video[]>([]);
+  const [castSugg, setCastSugg] = useState<Video[]>([]);
+  const [accounts, setAccounts] = useState<AccountInfo[]>([]);
+  const [uploads, setUploads] = useState<Video[]>([]);
+  const [saved, setSaved] = useState<Video[]>([]);
+  const [connecting, setConnecting] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
     VideosByModel(name).then((v) => { setVideos(v || []); setLoading(false); });
     PhotosByModel(name).then((p) => setPhotos(p || []));
-    if (name) GetModelInfo(name).then(setInfo); else setInfo(null);
+    if (name) {
+      GetModelInfo(name).then(setInfo);
+      // Verified accounts on the profile: surface any Unsorted videos from
+      // those accounts waiting to be claimed for this person.
+      AccountMatches(name).then((m) => setAcctMatches((m || []).filter((x) => x.unsortedCount > 0))).catch(() => {});
+      // Appears-in: videos they're featured in but didn't upload, plus
+      // metadata-based suggestions awaiting a yes.
+      VideosFeaturing(name).then((v) => setFeaturing(v || [])).catch(() => {});
+      CastSuggestions(name).then((v) => setCastSugg(v || [])).catch(() => {});
+      AccountsForPerson(name).then((a) => setAccounts(a || [])).catch(() => {});
+      VideosUploadedBy(name).then((v) => setUploads(v || [])).catch(() => {});
+      VideosSavedBy(name).then((v) => setSaved(v || [])).catch(() => {});
+    } else setInfo(null);
   }, [name]);
   useEffect(() => { load(); }, [load, version]);
   useEffect(() => { const off = EventsOn("import", (s: any) => { if (s.finished) load(); }); return () => { off(); }; }, [load]);
@@ -1171,50 +1305,79 @@ function ModelPage({ name, version, modelNames, onPlay, onChanged, onRenamed }:
   return (
     <>
       {name && (
-        <section className="relative overflow-hidden rounded-2xl border border-edge mb-6">
-          {avatar && <img src={mediaURL(avatar)} aria-hidden className="absolute inset-0 w-full h-full object-cover opacity-25 blur-2xl scale-125" />}
-          <div className="absolute inset-0 bg-gradient-to-t from-ink via-ink/85 to-ink/50" />
-          <div className="relative p-5 md:p-8 flex flex-col md:flex-row items-center md:items-end gap-5 md:gap-7">
+        <section className="model-hero relative overflow-hidden mb-8">
+          {avatar && <img src={mediaURL(avatar)} aria-hidden className="model-hero__media absolute inset-0 w-full h-full object-cover" />}
+          <div className="model-hero__scrim absolute inset-0" />
+          <div className="model-hero__content relative p-5 md:p-7 flex flex-col md:flex-row items-center md:items-end gap-5 md:gap-7">
             <button onClick={() => setAvatarOpen(true)} title="Change avatar"
-              className="avatar relative w-28 h-28 md:w-40 md:h-40 shrink-0 group">
+              className="model-avatar avatar relative w-28 h-28 md:w-36 md:h-36 shrink-0 group">
               {avatar
                 ? <img src={mediaURL(avatar)} className="w-full h-full object-cover" />
                 : <div className="w-full h-full grid place-items-center text-4xl text-muted">{(name[0] || "?").toUpperCase()}</div>}
               <span className="absolute inset-0 bg-black/45 opacity-0 group-hover:opacity-100 grid place-items-center text-white text-xs font-semibold transition">✎ Edit</span>
             </button>
             <div className="flex-1 min-w-0 text-center md:text-left">
-              <h1 className="text-2xl md:text-4xl font-extrabold tracking-tight">{modelLabel(name)}</h1>
+              <div className="eyebrow mb-2">Private profile</div>
+              <h1 className="model-name text-3xl md:text-4xl font-black tracking-tight">{modelLabel(name)}</h1>
               {NICK[name] && <div className="text-sm text-muted mt-0.5">{name}</div>}
               <div className="text-sm text-muted mt-1.5 flex flex-wrap gap-x-2 gap-y-1 justify-center md:justify-start items-center">
                 <span>{videos.length} video{videos.length === 1 ? "" : "s"}</span>
                 {totalSecs ? <><span>·</span><span>{fmtTotal(totalSecs)}</span></> : null}
                 {totalBytes ? <><span>·</span><span>{fmtSize(totalBytes)}</span></> : null}
-                {sites.length > 0 && <><span>·</span><span className="inline-flex gap-2 items-center">{sites.map((sname) => <SourceBadge key={sname} site={sname} />)}</span></>}
+                {accounts.length > 0 && <><span>·</span><span className="inline-flex gap-2 items-center">{accounts.map((ac) => <AccountBadge key={ac.platform + ac.handle} account={ac} />)}</span></>}
               </div>
               {info?.bio && <p className="text-sm text-fg/80 whitespace-pre-wrap mt-3 max-w-2xl">{info.bio}</p>}
               {info && info.links && info.links.length > 0 && (
                 <div className="flex flex-wrap gap-2 mt-3 justify-center md:justify-start">
                   {info.links.map((l, i) => (
-                    <button key={i} onClick={() => BrowserOpenURL(l.url)} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
-                      className="text-xs font-semibold px-3 py-1.5 rounded-full">{l.label} ↗</button>
+                    <button key={i} onClick={() => BrowserOpenURL(l.url)}
+                      className="profile-link text-xs font-bold px-3 py-1.5">{l.label} ↗</button>
                   ))}
                 </div>
               )}
-              <div className="flex flex-wrap gap-2 mt-4 justify-center md:justify-start">
+              <div className="model-actions flex flex-wrap gap-2 mt-5 justify-center md:justify-start">
                 {videos.length > 0 && <button onClick={() => onPlay(videos[0], videos)} className="glow-btn px-5 py-2 text-sm flex items-center gap-2">▶ Play all</button>}
-                {videos.length > 0 && <button onClick={() => onPlay(videos[Math.floor(Math.random() * videos.length)], videos)} className="px-4 py-2 text-sm font-semibold rounded-xl bg-panel2 hover:bg-edge text-fg border border-edge flex items-center gap-1.5">⤮ Shuffle</button>}
-                <button onClick={() => setAvatarOpen(true)} className="px-4 py-2 text-sm font-medium rounded-xl bg-panel2 hover:bg-edge text-fg border border-edge">Edit avatar</button>
-                <button onClick={() => setEditing(true)} className="px-4 py-2 text-sm font-medium rounded-xl bg-panel2 hover:bg-edge text-fg border border-edge">Edit profile</button>
+                {videos.length > 0 && <button onClick={() => onPlay(videos[Math.floor(Math.random() * videos.length)], videos)} className="secondary-btn px-4 py-2 text-sm font-semibold flex items-center gap-1.5"><Icon name="shuffle" className="w-4 h-4" />Shuffle</button>}
+                <button onClick={() => setAvatarOpen(true)} className="secondary-btn px-4 py-2 text-sm font-semibold">Edit avatar</button>
+                <button onClick={() => setEditing(true)} className="secondary-btn px-4 py-2 text-sm font-semibold">Edit profile</button>
+                <button onClick={() => setConnecting(true)} className="secondary-btn px-4 py-2 text-sm font-semibold">Accounts{accounts.length ? ` (${accounts.length})` : "…"}</button>
               </div>
             </div>
           </div>
         </section>
       )}
 
-      <div className="flex items-center gap-3 mb-3">
-        <h2 className="text-sm font-semibold text-muted">Photos{photos.length ? ` (${photos.length})` : ""}</h2>
-        <button onClick={() => ImportPhotosDialog(name)} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">Add photos…</button>
-        <button onClick={() => setPhotoURL(true)} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge">Add from URL…</button>
+      {acctMatches.map((m) => (
+        <div key={m.platform + m.handle} className="flex items-center flex-wrap gap-3 bg-panel border border-accent/40 rounded-xl px-4 py-3 mb-4 rise">
+          <Icon name="spark" className="w-4 h-4 text-accent shrink-0" />
+          <span className="text-sm flex-1 min-w-[16rem]">
+            <b>{m.unsortedCount}</b> unsorted video{m.unsortedCount === 1 ? "" : "s"} came from{" "}
+            <b>{m.platform === "x" ? "@" + m.handle + " on X" : m.handle + " on Pornhub"}</b> — {modelLabel(name)}'s verified account. Assign them?
+          </span>
+          <button disabled={claiming}
+            onClick={async () => {
+              setClaiming(true);
+              try {
+                await ClaimAccount(name, m.platform, m.handle);
+                setAcctMatches((xs) => xs.filter((x) => !(x.platform === m.platform && x.handle === m.handle)));
+                changed();
+              } finally { setClaiming(false); }
+            }}
+            style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+            className="text-xs font-bold px-4 py-2 rounded-full disabled:opacity-50">
+            {claiming ? "Assigning…" : `Assign ${m.unsortedCount}`}
+          </button>
+          <button onClick={() => setAcctMatches((xs) => xs.filter((x) => !(x.platform === m.platform && x.handle === m.handle)))}
+            className="text-xs text-muted hover:text-fg">Not now</button>
+        </div>
+      ))}
+
+      <div className="profile-section-header flex items-center gap-2 mb-3">
+        <h2 className="section-title">Photos <span>{photos.length}</span></h2>
+        <div className="ml-auto flex items-center gap-2">
+          <button onClick={() => ImportPhotosDialog(name)} className="secondary-btn text-xs font-semibold px-3 py-1.5">Add photos</button>
+          <button onClick={() => setPhotoURL(true)} className="secondary-btn text-xs font-semibold px-3 py-1.5">From URL</button>
+        </div>
       </div>
       {albums.map((a) => (
         <div key={a.title || "__loose"} className="mb-4">
@@ -1223,15 +1386,84 @@ function ModelPage({ name, version, modelNames, onPlay, onChanged, onRenamed }:
               {a.title} <span className="text-[11px] font-semibold text-muted/60">{a.items.length}</span>
             </div>
           )}
-          <div className="flex gap-2 overflow-x-auto pb-3">
+          <div className="photo-rail flex gap-2 overflow-x-auto pb-3">
             {a.items.map(({ p, i }) => (
               <img key={p.id} src={mediaURL(p.filepath)} loading="lazy" onClick={() => setLightbox(i)}
-                className="h-44 rounded-lg object-cover cursor-pointer hover:opacity-80 shrink-0" />
+                className="h-44 rounded-xl object-cover cursor-pointer hover:opacity-80 shrink-0" />
             ))}
           </div>
         </div>
       ))}
-      {loading ? <CardGridSkeleton /> : <VideoArea videos={videos} modelNames={modelNames} onPlay={onPlay} onChanged={changed} />}
+      {uploads.length > 0 && (
+        <>
+          <div className="profile-section-header video-section-heading flex items-end gap-3">
+            <div>
+              <div className="eyebrow">From their connected accounts</div>
+              <h2 className="section-title section-title--large">Uploads <span>{uploads.length}</span></h2>
+            </div>
+          </div>
+          <VideoArea videos={uploads} modelNames={modelNames} onPlay={onPlay} onChanged={changed} />
+        </>
+      )}
+      {saved.length > 0 && (
+        <>
+          <div className="profile-section-header video-section-heading flex items-end gap-3 mt-8">
+            <div>
+              <div className="eyebrow">Filed here by you — not from their accounts</div>
+              <h2 className="section-title section-title--large">Saved <span>{saved.length}</span></h2>
+            </div>
+          </div>
+          <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,290px),1fr))" }}>
+            {saved.map((v) => <VideoCard key={v.site + "/" + v.id} v={v} onClick={() => onPlay(v, saved)} />)}
+          </div>
+        </>
+      )}
+      {loading && uploads.length === 0 && saved.length === 0 && <CardGridSkeleton />}
+      {!loading && uploads.length === 0 && saved.length === 0 && videos.length > 0 && (
+        <VideoArea videos={videos} modelNames={modelNames} onPlay={onPlay} onChanged={changed} />
+      )}
+
+      {castSugg.length > 0 && (
+        <div className="bg-panel border border-accent/40 rounded-xl px-4 py-3 mt-8 rise">
+          <div className="flex items-center flex-wrap gap-2 mb-2.5">
+            <Icon name="spark" className="w-4 h-4 text-accent shrink-0" />
+            <span className="text-sm font-semibold flex-1 min-w-[14rem]">
+              {castSugg.length} video{castSugg.length === 1 ? "" : "s"} list {modelLabel(name)} in the cast — add to Appears in?
+            </span>
+            <button onClick={async () => { for (const v of castSugg) await AcceptCast(v.site, v.id, name); setCastSugg([]); changed(); }}
+              style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+              className="text-xs font-bold px-4 py-2 rounded-full">Add all</button>
+            <button onClick={() => setCastSugg([])} className="text-xs text-muted hover:text-fg">Not now</button>
+          </div>
+          <div className="chipstrip flex gap-2">
+            {castSugg.slice(0, 16).map((v) => (
+              <div key={v.site + "/" + v.id} className="relative shrink-0 w-40">
+                <img src={mediaURL(v.thumbnail)} loading="lazy" onClick={() => onPlay(v, castSugg)}
+                  className="w-40 aspect-video object-cover rounded-lg cursor-pointer" />
+                <button title="Add to Appears in"
+                  onClick={async () => { await AcceptCast(v.site, v.id, name); setCastSugg((xs) => xs.filter((x) => !(x.site === v.site && x.id === v.id))); changed(); }}
+                  style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+                  className="absolute top-1.5 right-1.5 w-6 h-6 grid place-items-center rounded-full text-sm font-bold">✓</button>
+                <div className="text-[11px] text-muted truncate mt-1">{v.title || v.uploader}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {featuring.length > 0 && (
+        <>
+          <div className="profile-section-header video-section-heading flex items-end gap-3 mt-8">
+            <div>
+              <div className="eyebrow">Didn't upload these — appears in them</div>
+              <h2 className="section-title section-title--large">Featured in <span>{featuring.length}</span></h2>
+            </div>
+          </div>
+          <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,290px),1fr))" }}>
+            {featuring.map((v) => <VideoCard key={v.site + "/" + v.id} v={v} onClick={() => onPlay(v, featuring)} />)}
+          </div>
+        </>
+      )}
       {lightbox !== null && (
         <Lightbox photos={photos} index={lightbox} onIndex={setLightbox} onClose={() => setLightbox(null)}
           onSetCover={name ? (p) => { SetModelCover(name, p.filepath).then(changed); setLightbox(null); } : undefined} />
@@ -1241,7 +1473,96 @@ function ModelPage({ name, version, modelNames, onPlay, onChanged, onRenamed }:
         onRenamed={(n) => { setEditing(false); onChanged(); onRenamed(n); }} />}
       {avatarOpen && <AvatarEditor name={name} videos={videos} onClose={() => setAvatarOpen(false)} onSaved={changed} />}
       {photoURL && <PhotosFromURLModal model={name} onClose={() => setPhotoURL(false)} />}
+      {connecting && <ConnectAccountsModal person={name} connected={accounts} onClose={() => setConnecting(false)} onChanged={changed} />}
     </>
+  );
+}
+
+// AccountBadge renders one connected platform account (click-through to the
+// profile). Badges come from CONNECTED accounts only — media saved from a
+// repost never paints a platform logo on a person.
+function AccountBadge({ account }: { account: AccountInfo }) {
+  return (
+    <button onClick={() => account.url && BrowserOpenURL(account.url)}
+      title={"@" + account.handle + " on " + account.platform}
+      className="inline-flex items-center gap-1.5 bg-panel2/70 border border-edge rounded-full px-2.5 py-0.5 hover:border-accent transition">
+      <PlatformLogo platform={account.platform} size="xs" />
+      <span className="text-[11px] font-semibold text-fg/85">@{account.handle}</span>
+    </button>
+  );
+}
+
+// ConnectAccountsModal: wire a person to the platform accounts that own their
+// videos — pick from what downloads have already discovered ("seen in N
+// videos"), or paste a profile URL to define one manually.
+function ConnectAccountsModal({ person, connected, onClose, onChanged }:
+  { person: string; connected: AccountInfo[]; onClose: () => void; onChanged: () => void }) {
+  const [all, setAll] = useState<AccountWithCount[]>([]);
+  const [q, setQ] = useState("");
+  const [url, setUrl] = useState("");
+  const reload = () => AccountsWithCounts().then((a) => setAll(a || [])).catch(() => {});
+  useEffect(() => { reload(); }, []);
+
+  const needle = q.trim().toLowerCase();
+  const candidates = all.filter((a) => !a.person &&
+    (!needle || a.handle.includes(needle) || (a.displayName || "").toLowerCase().includes(needle)))
+    .sort((x, y) => y.videoCount - x.videoCount).slice(0, 20);
+
+  const connect = async (a: AccountInfo) => { await ConnectAccount(a.platform, a.handle, person); reload(); onChanged(); };
+  const disconnect = async (a: AccountInfo) => { await ConnectAccount(a.platform, a.handle, ""); reload(); onChanged(); };
+  const addManual = async () => {
+    const u = url.trim();
+    if (!u) return;
+    setUrl("");
+    await CreateAccount(u, person);
+    reload(); onChanged();
+  };
+  const platLabel = (p: string) => (p === "x" ? "X" : p.charAt(0).toUpperCase() + p.slice(1));
+
+  return (
+    <div className="fixed inset-0 bg-black/65 backdrop-blur-sm z-50 grid place-items-center p-4" onClick={onClose}>
+      <div className="bg-panel border border-edge rounded-xl p-5 w-[92vw] max-w-[30rem] max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="font-semibold mb-1">{modelLabel(person)}&rsquo;s accounts</div>
+        <p className="text-xs text-muted mb-4">Connected accounts define which videos count as their uploads — and new downloads from them file themselves automatically.</p>
+
+        {connected.length > 0 && (
+          <div className="space-y-2 mb-4">
+            {connected.map((a) => (
+              <div key={a.platform + a.handle} className="flex items-center gap-2.5 bg-panel2 border border-edge rounded-lg px-3 py-2">
+                <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-panel border border-edge">{platLabel(a.platform)}</span>
+                <span className="text-sm flex-1 truncate">@{a.handle}{a.displayName && a.displayName.toLowerCase() !== a.handle ? " · " + a.displayName : ""}</span>
+                <button onClick={() => disconnect(a)} className="text-xs text-muted hover:text-rose-400">Disconnect</button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <label className="block text-xs text-muted mb-1">Connect a discovered account</label>
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search accounts seen in your downloads…"
+          className="w-full bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent mb-2" />
+        <div className="max-h-52 overflow-y-auto space-y-1.5 mb-4">
+          {candidates.map((a) => (
+            <div key={a.platform + a.handle} className="flex items-center gap-2.5 bg-panel2 border border-edge rounded-lg px-3 py-1.5">
+              <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-panel border border-edge">{platLabel(a.platform)}</span>
+              <span className="text-[13px] flex-1 truncate">@{a.handle}</span>
+              <span className="text-[11px] text-muted shrink-0">{a.videoCount} video{a.videoCount === 1 ? "" : "s"}</span>
+              <button onClick={() => connect(a)} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+                className="text-xs font-bold px-3 py-1 rounded-full">Connect</button>
+            </div>
+          ))}
+          {candidates.length === 0 && <div className="text-xs text-muted py-2">No unconnected accounts match.</div>}
+        </div>
+
+        <label className="block text-xs text-muted mb-1">Or paste a profile URL <span className="text-muted/60">(X, Pornhub, OnlyFans, Fansly, RedGifs)</span></label>
+        <div className="flex gap-2">
+          <input value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addManual(); }}
+            placeholder="https://…" className="flex-1 bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent" />
+          <button onClick={addManual} disabled={!url.trim()} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+            className="text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50">Add</button>
+        </div>
+        <div className="flex justify-end mt-4"><button onClick={onClose} className="text-sm text-muted hover:text-fg px-3 py-2">Done</button></div>
+      </div>
+    </div>
   );
 }
 
@@ -1478,14 +1799,14 @@ function VideoArea({ videos, groups, modelNames, collections, collectionId, onPl
       {(groups && groups.length ? groups : [{ title: "", videos }]).map((g, gi) => (
         <section key={g.title || gi}>
           {g.title && (
-            <h3 className="text-[13px] font-bold text-muted mt-6 mb-2.5 first:mt-0 flex items-baseline gap-2">
+            <h3 className="video-group-title text-[13px] font-bold text-muted mt-7 mb-3 first:mt-0 flex items-baseline gap-2">
               {g.title} <span className="text-[11px] font-semibold text-muted/60">{g.videos.length}</span>
               {slim && !selectMode && gi === 0 && (
                 <button onClick={() => setSelectMode(true)} className="ml-auto text-xs font-medium text-muted hover:text-fg">Select</button>
               )}
             </h3>
           )}
-          <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,290px),1fr))" }}>
+          <div className="video-grid grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,290px),1fr))" }}>
             {g.videos.map((v) => (
               <VideoCard key={key(v)} v={v} selectMode={selectMode} selected={picked.has(key(v))}
                 onClick={() => (selectMode ? toggle(v) : onPlay(v, videos))} />
@@ -1522,7 +1843,13 @@ function VideoCard({ v, onClick, selectMode, selected }:
       {!selectMode && v.duration ? <span className="absolute top-2 right-2 bg-black/75 text-white text-[11px] px-1.5 py-0.5 rounded">{fmtDur(v.duration)}</span> : null}
       <div className="absolute bottom-0 left-0 right-0 p-3">
         <div className="text-sm font-semibold line-clamp-1 leading-snug text-white cap">{v.favorite ? <span className="text-rose-300">❤ </span> : null}{v.title || v.uploader}</div>
-        <div className="text-xs text-white/85 mt-1 truncate cap">{v.models && v.models.length ? v.models.map(modelLabel).join(", ") : UNASSIGNED}</div>
+        <div className="text-xs text-white/85 mt-1 truncate cap">
+          {v.models && v.models.length
+            ? v.models.map(modelLabel).join(", ")
+            : (() => { const oa = ownerAccountOf(v); return oa
+                ? <span className="inline-flex items-center gap-1"><PlatformLogo platform={oa.platform} size="xs" /><span>@{oa.handle}</span></span>
+                : UNASSIGNED; })()}
+        </div>
       </div>
       {v.position && v.duration && v.position < v.duration * 0.95
         ? <div className="progress"><i style={{ width: `${Math.round((v.position / v.duration) * 100)}%` }} /></div>
@@ -1590,6 +1917,7 @@ function OrganizeSheet({ video, models, allLabels, collections, initial, onClose
   { video: Video; models: Model[]; allLabels: string[]; collections: Collection[];
     initial?: "people" | "tags" | "collections"; onClose: () => void; onChanged: () => void }) {
   const [vModels, setVModels] = useState<string[]>(video.models || []);
+  const [vFeatured, setVFeatured] = useState<string[]>(video.featured || []);
   const [vLabels, setVLabels] = useState<string[]>(video.labels || []);
   const [inColls, setInColls] = useState<Set<number>>(new Set());
   const [q, setQ] = useState("");
@@ -1607,6 +1935,7 @@ function OrganizeSheet({ video, models, allLabels, collections, initial, onClose
   }, [models]);
 
   const commitModels = async (next: string[]) => { setVModels(next); video.models = next; await SetModels(video.site, video.id, next); onChanged(); };
+  const commitFeatured = async (next: string[]) => { setVFeatured(next); video.featured = next; await SetFeatured(video.site, video.id, next); onChanged(); };
   const commitLabels = async (next: string[]) => { setVLabels(next); video.labels = next; await SetLabels(video.site, video.id, next); onChanged(); };
   const toggleColl = async (id: number) => {
     const next = new Set(inColls);
@@ -1630,7 +1959,14 @@ function OrganizeSheet({ video, models, allLabels, collections, initial, onClose
     if (!needle) return true;
     return m.name.toLowerCase().includes(needle) || (m.nickname || "").toLowerCase().includes(needle);
   };
-  const peopleSugg = models.filter((m) => m.name && !vModels.includes(m.name) && matches(m)).slice(0, 12);
+  const peopleSugg = models.filter((m) => m.name && !vModels.includes(m.name) && !vFeatured.includes(m.name) && matches(m)).slice(0, 12);
+  const [fq, setFq] = useState("");
+  const featSugg = models.filter((m) => {
+    const needle = fq.trim().toLowerCase();
+    if (!m.name || vModels.includes(m.name) || vFeatured.includes(m.name)) return false;
+    if (!needle) return false; // featured suggestions only appear while searching — keeps the sheet compact
+    return m.name.toLowerCase().includes(needle) || (m.nickname || "").toLowerCase().includes(needle);
+  }).slice(0, 10);
   const qExact = q.trim() && !models.some((m) => m.name.toLowerCase() === q.trim().toLowerCase());
   const tagSugg = allLabels.filter((l) => !vLabels.includes(l) && (!tagQ.trim() || l.toLowerCase().includes(tagQ.trim().toLowerCase()))).slice(0, 18);
   const tagExact = tagQ.trim() && !allLabels.some((l) => l.toLowerCase() === tagQ.trim().toLowerCase());
@@ -1680,6 +2016,30 @@ function OrganizeSheet({ video, models, allLabels, collections, initial, onClose
           <input value={q} onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && q.trim()) { const n = peopleSugg[0]?.name || q.trim(); setQ(""); if (!vModels.includes(n)) commitModels([...vModels, n]); } }}
             placeholder="Search or add a person…"
+            className="mt-2.5 w-full bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent" />
+        </div>
+
+        <div className="px-5 pt-5 scroll-mt-16">
+          <div className="text-xs font-bold text-muted uppercase tracking-wide mb-2.5">Appears in <span className="normal-case font-medium">(didn't upload it)</span></div>
+          <div className="flex flex-wrap gap-2">
+            {vFeatured.map((m) => (
+              <button key={m} onClick={() => commitFeatured(vFeatured.filter((x) => x !== m))} className={chipOn} style={onStyle}>
+                {avatars.get(m)
+                  ? <img src={mediaURL(avatars.get(m))} className="w-5 h-5 rounded-full object-cover -ml-1" />
+                  : null}
+                {modelLabel(m)} <span className="opacity-70">×</span>
+              </button>
+            ))}
+            {featSugg.map((m) => (
+              <button key={m.name} onClick={() => { setFq(""); commitFeatured([...vFeatured, m.name]); }} className={chipOff}>
+                {m.thumbnail ? <img src={mediaURL(m.thumbnail)} className="w-5 h-5 rounded-full object-cover -ml-1" /> : null}
+                {modelLabel(m.name)}
+              </button>
+            ))}
+          </div>
+          <input value={fq} onChange={(e) => setFq(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && fq.trim()) { const n = featSugg[0]?.name || fq.trim(); setFq(""); if (!vFeatured.includes(n)) commitFeatured([...vFeatured, n]); } }}
+            placeholder="Add someone who appears in this video…"
             className="mt-2.5 w-full bg-panel2 border border-edge rounded-lg px-3 py-2 text-sm outline-none focus:border-accent" />
         </div>
 
@@ -1741,7 +2101,9 @@ function WatchPage({ video, queue, allLabels, models: allModels, collections, on
   const [fav, setFav] = useState(!!video.favorite);
   const [labels, setLabels] = useState<string[]>(video.labels || []);
   const [models, setModelsState] = useState<string[]>(video.models || []);
+  const [featured, setFeatured] = useState<string[]>(video.featured || []);
   const [organizing, setOrganizing] = useState(false);
+  const [acctModal, setAcctModal] = useState<{ platform: string; handle: string; display: string } | null>(null);
   const [copied, setCopied] = useState(false);
   const [vidErr, setVidErr] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
@@ -1802,21 +2164,32 @@ function WatchPage({ video, queue, allLabels, models: allModels, collections, on
   const closeOrganize = () => {
     setOrganizing(false);
     setModelsState(video.models || []);
+    setFeatured(video.featured || []);
     setLabels(video.labels || []);
     loadRelated((video.models && video.models[0]) || "");
   };
   const avatarOf = (name: string) => allModels.find((m) => m.name === name)?.thumbnail || "";
-  const pill = "flex items-center gap-1.5 px-3.5 py-2 rounded-full text-sm font-medium bg-panel2 text-fg hover:bg-edge border border-edge whitespace-nowrap shrink-0 transition active:scale-95";
+  // Cast entries whose accounts have no person parent yet — shown as account
+  // chips so a person can be defined right from the video.
+  const castAccounts = (video.cast || []).flatMap((member) => {
+    const h = phSlug(member);
+    if (!h) return [];
+    const acct = ACCTS[acctKey("pornhub", h)];
+    if (acct?.person) return []; // resolved to a person (already in featured or owner)
+    if (models.some((m) => phSlug(m) === h) || featured.some((f) => phSlug(f) === h)) return [];
+    return [{ handle: h, display: member }];
+  });
+  const pill = "action-btn flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold whitespace-nowrap shrink-0 transition active:scale-95";
 
   return (
-    <div ref={topRef} className="fixed inset-0 z-30 md:left-56 bg-ink overflow-y-auto rise">
-      <div className="sticky top-0 z-10 glass border-b border-edge/70" style={{ paddingTop: "env(safe-area-inset-top)" }}>
-        <div className="px-4 md:px-5 py-2.5">
-          <button onClick={onClose} className="text-muted hover:text-fg text-sm font-semibold px-2 py-1.5 -ml-2 rounded-full active:bg-panel2">← Back</button>
+    <div ref={topRef} className="watch-page fixed inset-0 z-30 md:left-60 bg-ink overflow-y-auto rise">
+      <div className="watch-topbar sticky top-0 z-10 glass border-b border-edge/70" style={{ paddingTop: "env(safe-area-inset-top)" }}>
+        <div className="max-w-6xl mx-auto px-4 md:px-6 py-2.5">
+          <button onClick={onClose} className="watch-back text-muted hover:text-fg text-sm font-semibold px-2 py-1.5 -ml-2">← Back</button>
         </div>
       </div>
-      <div className="max-w-5xl mx-auto p-4 md:p-6 pb-28 md:pb-6">
-        <div className="relative bg-black -mx-4 -mt-4 md:mx-0 md:mt-0 md:rounded-blob overflow-hidden shadow-lg shadow-black/40">
+      <div className="watch-shell max-w-6xl mx-auto p-4 md:p-6 pb-28 md:pb-8">
+        <div className="watch-player relative bg-black -mx-4 -mt-4 md:mx-0 md:mt-0 overflow-hidden">
           <video ref={vidRef} src={videoURL(video.filepath)} controls autoPlay playsInline preload="metadata"
             poster={video.thumbnail ? mediaURL(video.thumbnail) : undefined}
             onLoadedMetadata={onLoaded} onTimeUpdate={() => savePos()} onPause={() => savePos(true)} onEnded={onEnded}
@@ -1835,16 +2208,17 @@ function WatchPage({ video, queue, allLabels, models: allModels, collections, on
           )}
         </div>
 
+        <section className="watch-info-panel">
         {queue.length > 1 && (
-          <div className="flex items-center gap-3 mt-3 text-sm">
-            <label className="flex items-center gap-2 cursor-pointer select-none">
+          <div className="watch-queue flex items-center gap-3 text-sm">
+            <label className="watch-autoplay flex items-center gap-2 cursor-pointer select-none">
               <input type="checkbox" checked={autoplay} className="w-4 h-4 accent-[color:var(--ac)]"
                 onChange={(e) => { setAutoplay(e.target.checked); localStorage.setItem("autoplayNext", e.target.checked ? "1" : "0"); }} />
-              <span className="text-muted">Autoplay next</span>
+              <span>Autoplay next</span>
             </label>
             {next && (
-              <button onClick={() => onPlay(next, queue)} className="ml-auto text-fg hover:text-accent font-medium truncate max-w-[60%]">
-                Next: <span className="text-muted">{next.title || next.uploader}</span> ▶
+              <button onClick={() => onPlay(next, queue)} className="watch-next ml-auto truncate max-w-[68%]">
+                <span>Next</span> {next.title || next.uploader} <b>▶</b>
               </button>
             )}
           </div>
@@ -1853,17 +2227,22 @@ function WatchPage({ video, queue, allLabels, models: allModels, collections, on
         {editing
           ? <input value={tv} autoFocus onChange={(e) => setTv(e.target.value)} onBlur={saveTitle}
               onKeyDown={(e) => { if (e.key === "Enter") saveTitle(); if (e.key === "Escape") setEditing(false); }}
-              className="text-xl font-semibold w-full mt-4 bg-panel2 border border-edge rounded px-2 py-1 outline-none focus:border-accent" />
+              className="watch-title-input w-full bg-panel2 border border-edge rounded-lg px-3 py-2 outline-none focus:border-accent" />
           : <h1 onClick={() => { setTv(video.title || ""); setEditing(true); }}
-              className="text-xl font-semibold mt-4 cursor-text hover:opacity-90">{video.title || video.uploader} <span className="text-muted text-sm">✎</span></h1>}
+              className="watch-title cursor-text hover:opacity-90">{video.title || video.uploader} <span className="watch-edit-mark">✎</span></h1>}
 
         {/* Person row — channel-style: avatar + name, tap through; Edit opens Organize. */}
-        <div className="flex items-center flex-wrap gap-x-4 gap-y-2 mt-3.5">
+        <div className="watch-people flex items-center flex-wrap gap-x-4 gap-y-2">
           {models.length === 0
-            ? <button onClick={() => setOrganizing(true)} className="flex items-center gap-2.5 text-muted hover:text-fg">
-                <span className="w-9 h-9 rounded-full bg-panel2 border border-edge grid place-items-center"><Icon name="people" className="w-4.5 h-4.5" /></span>
-                <span className="text-sm font-medium">Add a person</span>
-              </button>
+            ? (() => { const oa = ownerAccountOf(video); return oa
+                ? <span className="inline-flex items-center gap-2.5">
+                    <AccountChip platform={oa.platform} handle={oa.handle} onClick={() => setAcctModal(oa)} />
+                    <button onClick={() => setOrganizing(true)} className="text-xs text-muted hover:text-fg">or add a person</button>
+                  </span>
+                : <button onClick={() => setOrganizing(true)} className="flex items-center gap-2.5 text-muted hover:text-fg">
+                    <span className="w-9 h-9 rounded-full bg-panel2 border border-edge grid place-items-center"><Icon name="people" className="w-4.5 h-4.5" /></span>
+                    <span className="text-sm font-medium">Add a person</span>
+                  </button>; })()
             : models.map((m) => (
                 <button key={m} onClick={() => onOpenModel(m)} className="flex items-center gap-2.5 group">
                   {avatarOf(m)
@@ -1874,16 +2253,37 @@ function WatchPage({ video, queue, allLabels, models: allModels, collections, on
               ))}
         </div>
 
+        {/* Appears in — persons first, then cast ACCOUNTS with no person yet
+            (click one to define its person). */}
+        {(featured.length > 0 || castAccounts.length > 0) && (
+          <div className="flex items-center flex-wrap gap-2 mt-2.5 text-sm">
+            <span className="text-muted text-xs font-semibold uppercase tracking-wide">Featuring</span>
+            {featured.map((m) => (
+              <button key={m} onClick={() => onOpenModel(m)}
+                className="flex items-center gap-1.5 bg-panel2 border border-edge rounded-full pl-1 pr-3 py-1 hover:border-accent transition">
+                {avatarOf(m)
+                  ? <img src={mediaURL(avatarOf(m))} className="w-6 h-6 rounded-full object-cover" />
+                  : <span className="w-6 h-6 rounded-full bg-panel grid place-items-center text-[11px] font-bold text-muted">{modelLabel(m)[0]?.toUpperCase()}</span>}
+                <span className="text-[13px] font-medium">{modelLabel(m)}</span>
+              </button>
+            ))}
+            {castAccounts.map((ca) => (
+              <AccountChip key={ca.handle} platform="pornhub" handle={ca.handle}
+                onClick={() => setAcctModal({ platform: "pornhub", handle: ca.handle, display: ca.display })} />
+            ))}
+          </div>
+        )}
+
         {/* Tags — passive chips; edited in Organize. */}
         {labels.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mt-3">
-            {labels.map((l) => <span key={l} className="text-xs bg-panel2 border border-edge rounded-full px-2.5 py-1 text-fg/85">{l}</span>)}
+          <div className="watch-tags flex flex-wrap gap-1.5">
+            {labels.map((l) => <span key={l} className="text-xs">{l}</span>)}
           </div>
         )}
 
         {/* Action bar — one scrollable row of equal-weight pills. */}
-        <div className="chipstrip flex items-center gap-2 mt-4 -mx-4 px-4 md:mx-0 md:px-0">
-          <button onClick={toggleFav} className={`${pill} font-semibold ${fav ? "!bg-rose-500 !text-white !border-transparent" : ""}`}>
+        <div className="watch-actions chipstrip flex items-center gap-2 -mx-4 px-4 md:mx-0 md:px-0">
+          <button onClick={toggleFav} className={`${pill} ${fav ? "is-active" : ""}`}>
             <Icon name={fav ? "heart-fill" : "heart"} className="w-4 h-4" />{fav ? "Liked" : "Like"}
           </button>
           <button onClick={() => setOrganizing(true)} className={pill}><Icon name="tag" className="w-4 h-4" />Organize</button>
@@ -1893,31 +2293,37 @@ function WatchPage({ video, queue, allLabels, models: allModels, collections, on
         </div>
 
         {/* Details line — small, muted, out of the way. */}
-        <div className="text-xs text-muted mt-3.5">
+        <div className="watch-facts text-xs text-muted">
           {[label(video.site), video.height ? `${video.height}p` : "", fmtSize(video.filesize), fmtDate(video.upload_date)].filter(Boolean).join("  ·  ")}
         </div>
+        </section>
 
         {next && (
-          <div className="mt-8">
-            <h2 className="font-semibold mb-3">Up next</h2>
-            <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,260px),1fr))" }}>
+          <section className="watch-section">
+            <h2 className="section-title mb-3">Up next</h2>
+            <div className="watch-grid grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,260px),1fr))" }}>
               {queue.slice(idx + 1, idx + 13).map((v) => <VideoCard key={v.site + "/" + v.id} v={v} onClick={() => onPlay(v, queue)} />)}
             </div>
-          </div>
+          </section>
         )}
 
         {related.length > 0 && (
-          <div className="mt-8">
-            <h2 className="font-semibold mb-3">More from {primary ? modelLabel(primary) : "this collection"}</h2>
-            <div className="grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,260px),1fr))" }}>
+          <section className="watch-section">
+            <h2 className="section-title mb-3">More from {primary ? modelLabel(primary) : "this collection"}</h2>
+            <div className="watch-grid grid gap-3 md:gap-4" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(clamp(150px,44vw,260px),1fr))" }}>
               {related.map((v) => <VideoCard key={v.site + "/" + v.id} v={v} onClick={() => onPlay(v, related)} />)}
             </div>
-          </div>
+          </section>
         )}
       </div>
       {organizing && (
         <OrganizeSheet video={video} models={allModels} allLabels={allLabels} collections={collections}
           onClose={closeOrganize} onChanged={onChanged} />
+      )}
+      {acctModal && (
+        <AccountActionModal platform={acctModal.platform} handle={acctModal.handle} display={acctModal.display}
+          modelNames={allModels.map((m) => m.name).filter(Boolean)}
+          onClose={() => setAcctModal(null)} onChanged={onChanged} />
       )}
     </div>
   );
@@ -2112,6 +2518,19 @@ function SettingsPage() {
     finally { setRebuilding(false); }
   };
   const fetchAvatars = () => { setAvBusy(true); setAvProg(null); FetchAllAvatars(); };
+  const [plan, setPlan] = useState<ReinterpretPlan | null>(null);
+  const [planBusy, setPlanBusy] = useState(false);
+  const [applied, setApplied] = useState<Record<string, number> | null>(null);
+  const scanPlan = async () => { setPlanBusy(true); setApplied(null); try { setPlan(await GetReinterpretPlan()); } finally { setPlanBusy(false); } };
+  const applyPlan = async () => {
+    setPlanBusy(true);
+    try { setApplied(await ApplyReinterpret()); setPlan(await GetReinterpretPlan()); } finally { setPlanBusy(false); }
+  };
+  const resolveReview = async (act: ReinterpretAction, keep: boolean) => {
+    if (keep) await ReinterpretKeep(act.video.site, act.video.id, act.person);
+    else await ReinterpretToFeatured(act.video.site, act.video.id, act.person);
+    setPlan((p) => p && { ...p, review: p.review.filter((x) => !(x.video.site === act.video.site && x.video.id === act.video.id && x.person === act.person)) });
+  };
   const change = async () => { const next = await ChooseMediaRoot(); if (next && next !== root) { setRoot(next); setChanged(true); } };
   const siteColor = (s: string) => (s === "PornHub" ? "#e8964e" : s === "Twitter" ? "#5da4d4" : "var(--ac)");
 
@@ -2165,6 +2584,52 @@ function SettingsPage() {
       </section>
 
       <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
+        <div className="text-sm font-semibold mb-1">Reorganize with accounts</div>
+        <p className="text-xs text-muted mb-3 leading-relaxed">
+          Re-reads every person assignment through the platform accounts: people who only <b>appear</b> in
+          a video (per its cast) move to Appears-in automatically, cast-connected people get added, and the
+          few unexplained cases wait below for your call. Deliberate saves are never touched.
+        </p>
+        {plan === null
+          ? <button onClick={scanPlan} disabled={planBusy} className="text-sm font-medium px-4 py-2 rounded-lg bg-panel2 hover:bg-edge text-fg border border-edge disabled:opacity-50">{planBusy ? "Scanning…" : "Scan library"}</button>
+          : (
+            <>
+              {(plan.toFeatured.length > 0 || plan.autoFeatured.length > 0) && (
+                <div className="flex items-center flex-wrap gap-3 mb-3">
+                  <span className="text-sm">
+                    <b>{plan.toFeatured.length}</b> to move to Appears-in · <b>{plan.autoFeatured.length}</b> cast members to add
+                  </span>
+                  <button onClick={applyPlan} disabled={planBusy} style={{ background: "var(--ac)", color: "var(--ac-ink)" }}
+                    className="text-xs font-bold px-4 py-2 rounded-full disabled:opacity-50">{planBusy ? "Applying…" : "Apply automatic fixes"}</button>
+                </div>
+              )}
+              {applied && <div className="text-sm text-emerald-400 mb-3">Applied — {applied["moved-to-featured"] || 0} moved, {applied["auto-featured"] || 0} added ✓</div>}
+              {plan.toFeatured.length === 0 && plan.autoFeatured.length === 0 && plan.review.length === 0 && (
+                <div className="text-sm text-emerald-400">Everything matches the accounts — all clean ✓</div>
+              )}
+              {plan.review.length > 0 && (
+                <>
+                  <div className="text-xs font-bold text-muted uppercase tracking-wide mt-2 mb-2">Needs your call · {plan.review.length}</div>
+                  <div className="max-h-80 overflow-y-auto space-y-2 pr-1">
+                    {plan.review.map((m) => (
+                      <div key={m.video.site + "/" + m.video.id + "/" + m.person} className="flex items-center gap-3 bg-panel2 border border-edge rounded-lg px-3 py-2">
+                        {m.video.thumbnail && <img src={mediaURL(m.video.thumbnail)} className="w-16 aspect-video object-cover rounded shrink-0" />}
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[13px] truncate">{m.video.title || m.video.id}</div>
+                          <div className="text-[11px] text-muted truncate"><b className="text-fg/80">{modelLabel(m.person)}</b> — {m.reason} · uploader: {m.video.uploader || "—"}</div>
+                        </div>
+                        <button onClick={() => resolveReview(m, true)} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-panel hover:bg-edge text-fg border border-edge shrink-0">Keep saved</button>
+                        <button onClick={() => resolveReview(m, false)} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-panel hover:bg-edge text-fg border border-edge shrink-0">Appears in</button>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+      </section>
+
+            <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
         <div className="text-sm font-semibold mb-1">Fix videos for mobile</div>
         <p className="text-xs text-muted mb-3 leading-relaxed">
           Some downloads store their index at the end of the file, so phones sit on a spinner

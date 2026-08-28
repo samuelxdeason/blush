@@ -5,6 +5,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -124,6 +125,215 @@ func (c *Core) SaveModelInfo(name, nickname, bio string, links []library.ModelLi
 
 // RenameModel renames a person across videos, photos, and their profile.
 func (c *Core) RenameModel(from, to string) error { return c.db.RenameModel(from, to) }
+
+// AccountMatch is one verified platform account on a person's profile, with
+// how many Unsorted videos from that account are waiting to be claimed.
+type AccountMatch struct {
+	Platform      string `json:"platform"`
+	Handle        string `json:"handle"`
+	UnsortedCount int    `json:"unsortedCount"`
+}
+
+// AccountMatches scans a person's profile links for platform accounts and
+// counts the Unsorted videos downloaded from each.
+func (c *Core) AccountMatches(name string) ([]AccountMatch, error) {
+	info, err := c.db.GetModelInfo(name)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[library.Account]bool{}
+	out := []AccountMatch{}
+	for _, l := range info.Links {
+		a, ok := library.AccountFromURL(l.URL)
+		if !ok || seen[a] {
+			continue
+		}
+		seen[a] = true
+		vids, err := c.db.UnsortedFromAccount(a)
+		if err != nil {
+			continue
+		}
+		out = append(out, AccountMatch{Platform: a.Platform, Handle: a.Handle, UnsortedCount: len(vids)})
+	}
+	return out, nil
+}
+
+// ClaimAccount assigns person to every Unsorted video from the account.
+func (c *Core) ClaimAccount(name, platform, handle string) (int, error) {
+	return c.db.AssignAccount(library.Account{Platform: platform, Handle: handle}, name)
+}
+
+// ---- appears-in (featured) ---------------------------------------------
+
+func (c *Core) SetFeatured(site, id string, people []string) error {
+	return c.db.SetFeatured(site, id, people)
+}
+func (c *Core) VideosFeaturing(name string) ([]library.Video, error) {
+	return c.db.VideosFeaturing(name)
+}
+func (c *Core) AddFeatured(site, id, person string) error { return c.db.AddFeatured(site, id, person) }
+
+// ---- platform accounts --------------------------------------------------
+
+func (c *Core) Accounts() ([]library.AccountInfo, error) { return c.db.Accounts() }
+func (c *Core) AccountsForPerson(name string) ([]library.AccountInfo, error) {
+	return c.db.AccountsForPerson(name)
+}
+func (c *Core) ConnectAccount(platform, handle, person string) error {
+	return c.db.ConnectAccount(platform, handle, person)
+}
+
+// AccountWithCount pairs an account with how many videos it owns.
+type AccountWithCount struct {
+	library.AccountInfo
+	VideoCount int `json:"videoCount"`
+}
+
+// AccountsWithCounts lists every account with its owned-video tally.
+func (c *Core) AccountsWithCounts() ([]AccountWithCount, error) {
+	accts, err := c.db.Accounts()
+	if err != nil {
+		return nil, err
+	}
+	counts, err := c.db.AccountVideoCounts()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AccountWithCount, 0, len(accts))
+	for _, a := range accts {
+		out = append(out, AccountWithCount{AccountInfo: a,
+			VideoCount: counts[library.Account{Platform: a.Platform, Handle: a.Handle}]})
+	}
+	return out, nil
+}
+
+// VideosUploadedBy / VideosSavedBy split a person's videos into what their
+// connected accounts own vs what was deliberately saved to them.
+func (c *Core) VideosUploadedBy(name string) ([]library.Video, error) {
+	return c.db.VideosUploadedBy(name)
+}
+func (c *Core) VideosSavedBy(name string) ([]library.Video, error) { return c.db.VideosSavedBy(name) }
+
+// CreateAccount defines an account by hand (no downloads needed) and
+// optionally connects it to a person. A profile URL alone is enough — the
+// platform and handle are recognised from it.
+func (c *Core) CreateAccount(a library.AccountInfo) error {
+	if a.Handle == "" && a.URL != "" {
+		if parsed, ok := library.AccountFromURL(a.URL); ok {
+			a.Platform, a.Handle = parsed.Platform, parsed.Handle
+		}
+	}
+	a.Source = "manual"
+	if err := c.db.UpsertAccount(a); err != nil {
+		return err
+	}
+	if a.Person != "" {
+		return c.db.ConnectAccount(a.Platform, a.Handle, a.Person)
+	}
+	return nil
+}
+
+// AdoptAccount gives an account a person parent in one step: connect it,
+// make sure the person exists (even with no media yet), claim the Unsorted
+// videos the account owns, and re-run cast resolution so appears-in fills in.
+func (c *Core) AdoptAccount(platform, handle, person string) (map[string]int, error) {
+	person = strings.TrimSpace(person)
+	handle = strings.ToLower(strings.TrimSpace(handle))
+	if person == "" || handle == "" || platform == "" {
+		return nil, fmt.Errorf("platform, handle and person are all required")
+	}
+	_ = c.db.UpsertAccount(library.AccountInfo{Platform: platform, Handle: handle, Source: "manual"})
+	if err := c.db.ConnectAccount(platform, handle, person); err != nil {
+		return nil, err
+	}
+	info, _ := c.db.GetModelInfo(person)
+	_ = c.db.SaveModelInfo(person, info.Nickname, info.Bio, info.Links) // person exists even with zero media
+	claimed, _ := c.db.AssignAccount(library.Account{Platform: platform, Handle: handle}, person)
+	stats, err := c.db.ApplyReinterpretPlan()
+	if err != nil {
+		stats = map[string]int{}
+	}
+	stats["claimed"] = claimed
+	return stats, nil
+}
+
+// BackfillAccounts rebuilds the accounts table from trusted links, sidecar
+// metadata, and video URLs. Idempotent; safe to re-run.
+func (c *Core) BackfillAccounts() (map[string]int, error) {
+	return c.db.BackfillAccounts(func(site, id string) (string, []string, bool) {
+		data, err := os.ReadFile(filepath.Join(c.stateDir, library.MetaDirName, library.FlatBase(site, id)+".info.json"))
+		if err != nil {
+			return "", nil, false
+		}
+		var meta struct {
+			UploaderID string   `json:"uploader_id"`
+			Cast       []string `json:"cast"`
+		}
+		if json.Unmarshal(data, &meta) != nil {
+			return "", nil, false
+		}
+		return meta.UploaderID, meta.Cast, true
+	})
+}
+
+// Reinterpretation: propose/apply the accounts-based re-read of every manual
+// person assignment (see library.BuildReinterpretPlan for the rules).
+func (c *Core) ReinterpretPlan() (library.ReinterpretPlan, error) { return c.db.BuildReinterpretPlan() }
+func (c *Core) ReinterpretApply() (map[string]int, error)         { return c.db.ApplyReinterpretPlan() }
+func (c *Core) ConfirmSaved(site, id, person string) error        { return c.db.ConfirmSaved(site, id, person) }
+func (c *Core) DemoteToFeatured(site, id, person string) error    { return c.db.DemoteToFeatured(site, id, person) }
+
+// CastSuggestions finds videos whose downloaded metadata (the .info.json
+// sidecars) lists the person in the cast, but which aren't yet linked to them
+// — candidates for their "Appears in" section. Suggestion only; nothing is
+// written until the user accepts.
+func (c *Core) CastSuggestions(name string) ([]library.Video, error) {
+	info, _ := c.db.GetModelInfo(name)
+	aliases := map[string]bool{strings.ToLower(strings.TrimSpace(name)): true}
+	if n := strings.ToLower(strings.TrimSpace(info.Nickname)); n != "" {
+		aliases[n] = true
+	}
+	vids, err := c.db.AllVideos(50000, 0, "newest", "", false, 0)
+	if err != nil {
+		return nil, err
+	}
+	var out []library.Video
+	for _, v := range vids {
+		if hasPersonFold(v.Models, name) || hasPersonFold(v.Featured, name) {
+			continue
+		}
+		metaPath := filepath.Join(c.stateDir, library.MetaDirName, library.FlatBase(v.Site, v.ID)+".info.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var meta struct {
+			Cast []string `json:"cast"`
+		}
+		if json.Unmarshal(data, &meta) != nil {
+			continue
+		}
+		for _, member := range meta.Cast {
+			if aliases[strings.ToLower(strings.TrimSpace(member))] {
+				out = append(out, v)
+				break
+			}
+		}
+		if len(out) >= 200 {
+			break
+		}
+	}
+	return out, nil
+}
+
+func hasPersonFold(list []string, name string) bool {
+	for _, x := range list {
+		if strings.EqualFold(x, name) {
+			return true
+		}
+	}
+	return false
+}
 
 func (c *Core) MarkWatched(site, id string) {
 	_ = c.db.MarkWatched(site, id, time.Now().Format("2006-01-02 15:04:05"))

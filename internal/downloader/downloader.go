@@ -761,6 +761,7 @@ type ytInfo struct {
 	Tags         []string `json:"tags"`
 	Categories   []string `json:"categories"`
 	Description  string   `json:"description"`
+	Cast         []string `json:"cast"`
 }
 
 // ---- flat layout paths ---------------------------------------------------
@@ -839,6 +840,8 @@ func (d *Downloader) ingestFrom(filepathStr, sidecar string) (library.Video, boo
 		Site:         info.ExtractorKey,
 		Title:        firstNonEmpty(info.Title, uploader),
 		Uploader:     uploader,
+		UploaderID:   info.UploaderID,
+		Cast:         info.Cast,
 		Models:       models,
 		Width:        info.Width,
 		Height:       info.Height,

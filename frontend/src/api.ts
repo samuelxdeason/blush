@@ -89,6 +89,53 @@ export const SaveModelInfo = (name: string, nickname: string, bio: string, links
   postJSON("/api/savemodelinfo", { name, nickname, bio, links });
 // RenameModel renames a person everywhere (videos, photos, profile).
 export const RenameModel = (name: string, newName: string) => postJSON("/api/model/rename", { name, newName });
+// Verified platform accounts: a profile link to x.com/<handle> or a Pornhub
+// pornstar/channel page claims that account. AccountMatches lists claimed
+// accounts with how many Unsorted videos await them; ClaimAccount assigns
+// those videos to the person. Assigning a video manually implies nothing
+// about the account that posted it — only saved links create claims.
+export type AccountMatch = { platform: string; handle: string; unsortedCount: number };
+export const AccountMatches = (name: string) => getJSON<AccountMatch[]>("/api/model/accountmatches" + qs({ name }));
+export const ClaimAccount = (name: string, platform: string, handle: string) =>
+  postJSON<{ assigned: number }>("/api/model/claimaccount", { name, platform, handle });
+
+// Appears-in ("featured"): people who are IN a video but didn't upload it —
+// kept separate from the owner/collection assignment on purpose.
+export const SetFeatured = (site: string, id: string, featured: string[]) =>
+  postJSON("/api/setfeatured", { site, id, featured });
+export const VideosFeaturing = (model: string) => getJSON<Video[]>("/api/videos/featuring" + qs({ model }));
+// CastSuggestions: videos whose downloaded metadata lists the person in the
+// cast but aren't linked to them yet; AcceptCast adds one to their appears-in.
+export const CastSuggestions = (name: string) => getJSON<Video[]>("/api/model/castsuggestions" + qs({ name }));
+export const AcceptCast = (site: string, id: string, name: string) => postJSON("/api/model/acceptcast", { site, id, name });
+// Reinterpretation: the accounts-based re-read of every manual assignment.
+// The plan's toFeatured/autoFeatured apply automatically; review items wait
+// for a human (keep = deliberate save, tofeatured = they only appear in it).
+// Platform accounts: the identities that own videos. People connect to
+// accounts; badges and the Uploads section derive from connections only.
+export type AccountInfo = { platform: string; handle: string; kind: string; displayName: string; url: string; person: string; source: string; firstSeen: string };
+export type AccountWithCount = AccountInfo & { videoCount: number };
+export const AllAccounts = () => getJSON<AccountInfo[]>("/api/accounts");
+export const AccountsWithCounts = () => getJSON<AccountWithCount[]>("/api/accounts?counts=1");
+// AdoptAccount: connect an account to a person (creating the person if new),
+// claim the Unsorted videos it owns, and resolve its cast appearances.
+export const AdoptAccount = (platform: string, handle: string, name: string) =>
+  postJSON<Record<string, number>>("/api/accounts/adopt", { platform, handle, name });
+export const AccountsForPerson = (name: string) => getJSON<AccountInfo[]>("/api/accounts/for-person" + qs({ name }));
+// ConnectAccount("", …) with an empty name disconnects.
+export const ConnectAccount = (platform: string, handle: string, name: string) =>
+  postJSON("/api/accounts/connect", { platform, handle, name });
+// CreateAccount from a pasted profile URL (platform+handle recognised server-side).
+export const CreateAccount = (url: string, name: string) => postJSON("/api/accounts/create", { url, name });
+export const VideosUploadedBy = (name: string) => getJSON<Video[]>("/api/videos/uploads" + qs({ name }));
+export const VideosSavedBy = (name: string) => getJSON<Video[]>("/api/videos/saved" + qs({ name }));
+
+export type ReinterpretAction = { video: Video; person: string; reason: string };
+export type ReinterpretPlan = { toFeatured: ReinterpretAction[]; autoFeatured: ReinterpretAction[]; review: ReinterpretAction[] };
+export const GetReinterpretPlan = () => getJSON<ReinterpretPlan>("/api/maintenance/reinterpret");
+export const ApplyReinterpret = () => postJSON<Record<string, number>>("/api/maintenance/reinterpret/apply");
+export const ReinterpretKeep = (site: string, id: string, name: string) => postJSON("/api/maintenance/reinterpret/keep", { site, id, name });
+export const ReinterpretToFeatured = (site: string, id: string, name: string) => postJSON("/api/maintenance/reinterpret/tofeatured", { site, id, name });
 // Avatar editing: download from a URL, or upload a file. (Picking a video frame
 // reuses SetModelCover with that video's thumbnail path.)
 export const SetAvatarFromURL = (name: string, url: string) => postJSON("/api/avatar/url", { name, url });
