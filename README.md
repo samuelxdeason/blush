@@ -1,4 +1,4 @@
-# trove
+# Trove
 
 Self-hosted library for media you save from anywhere. A headless Go server
 (`troved`) owns the catalogue and serves the HTTP API, SSE events, media, and

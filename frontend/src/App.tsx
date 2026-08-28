@@ -42,20 +42,22 @@ const fmtDate = (d?: string) => {
   return isNaN(t) ? "" : new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 };
 
-// Flavor presets — applied at runtime by setting --ac-rgb (Tailwind's accent
-// token + all glows derive from it), persisted in localStorage.
+// Mineral accents — every Trove can have its own identifying seal.
 const ACCENTS: { name: string; rgb: string }[] = [
-  { name: "Strawberry", rgb: "236 92 133" },
-  { name: "Peach", rgb: "247 128 86" },
-  { name: "Blueberry", rgb: "124 108 224" },
-  { name: "Matcha", rgb: "106 158 96" },
-  { name: "Mango", rgb: "240 158 42" },
+  { name: "Brass", rgb: "199 151 72" },
+  { name: "Garnet", rgb: "177 83 72" },
+  { name: "Emerald", rgb: "77 144 110" },
+  { name: "Lapis", rgb: "82 119 170" },
+  { name: "Amethyst", rgb: "132 100 165" },
 ];
+const savedAccent = () => {
+  const saved = localStorage.accent;
+  return ACCENTS.some((accent) => accent.rgb === saved) ? saved : ACCENTS[0].rgb;
+};
 const applyAccent = (rgb: string) => document.documentElement.style.setProperty("--ac-rgb", rgb);
 
-// Every collection gets its own fruit tint (rotating), so the sidebar reads
-// like a well-stocked fridge instead of a file tree.
-const COLL_TINTS = ["#F0568C", "#FF8A5C", "#8B7BF0", "#7FB069", "#FFB03A"];
+// Collection markers borrow from the colors of old maps, minerals and wax seals.
+const COLL_TINTS = ["#C79748", "#A95D4F", "#4D9073", "#5277AA", "#8464A5"];
 const collTint = (i: number) => COLL_TINTS[i % COLL_TINTS.length];
 
 // Hover previews only make sense where a real pointer can hover — on touch
@@ -111,11 +113,6 @@ function fmtAgo(s?: string) {
 const SYNC_ICON: Record<string, string> = { favorites: "❤", pornstar: "★", model: "★", channel: "📺", user: "👤", list: "≣" };
 const kindIcon = (k: string) => SYNC_ICON[k] || "≣";
 
-// Greeting + flavor emoji for the Home header — a small yogurt touch.
-const FLAVOR_EMOJI: Record<string, string> = {
-  "236 92 133": "🍓", "247 128 86": "🍑", "124 108 224": "🫐", "106 158 96": "🍵", "240 158 42": "🥭",
-};
-const flavorEmoji = () => FLAVOR_EMOJI[localStorage.accent] || "🍓";
 const greeting = () => {
   const h = new Date().getHours();
   return h < 5 ? "Up late?" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
@@ -136,8 +133,7 @@ const STATUS_COLORS: Record<string, string> = {
   error: "bg-rose-600 text-white",
 };
 
-// Icon: one consistent hand-rolled stroke set (round caps = soft yogurt look),
-// replacing the mismatched emoji that used to fill the nav.
+// One consistent hand-rolled icon set for the archive UI.
 function Icon({ name, className = "w-[18px] h-[18px]" }: { name: string; className?: string }) {
   const p: Record<string, JSX.Element> = {
     home: <><path d="M3.5 10.8 12 3.5l8.5 7.3" /><path d="M5.5 9.5V20a.8.8 0 0 0 .8.8H10v-5.6h4v5.6h3.7a.8.8 0 0 0 .8-.8V9.5" /></>,
@@ -173,13 +169,15 @@ function Icon({ name, className = "w-[18px] h-[18px]" }: { name: string; classNa
   );
 }
 
-// Swirl: the little yogurt-swirl logo mark, tinted by the active flavor.
-function Swirl({ className = "w-6 h-6" }: { className?: string }) {
+// Trove's faceted seal: a gem-like container with a small keyhole at its heart.
+function TroveMark({ className = "w-6 h-6" }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" className={className} aria-hidden>
-      <circle cx="12" cy="12" r="10" fill="var(--ac)" />
-      <path d="M16.8 8.2a6 6 0 1 0 1 5.2M12 8.8a3.4 3.4 0 1 0 3.3 4.3"
-        fill="none" stroke="rgba(255,253,250,.9)" strokeWidth="1.7" strokeLinecap="round" />
+    <svg viewBox="0 0 32 32" className={className} aria-hidden>
+      <path d="M16 1.8 27.7 8.5v15L16 30.2 4.3 23.5v-15z" fill="var(--ac)" />
+      <path d="m16 1.8 4.4 9.4 7.3-2.7M16 1.8l-4.4 9.4-7.3-2.7M4.3 23.5l7.3-2.7L16 30.2l4.4-9.4 7.3 2.7"
+        fill="none" stroke="rgba(255,250,236,.38)" strokeWidth="1" />
+      <circle cx="16" cy="14.4" r="2.5" fill="#111411" />
+      <path d="M14.8 16.2h2.4l1 5h-4.4z" fill="#111411" />
     </svg>
   );
 }
@@ -264,7 +262,9 @@ export default function App() {
   }, [route]);
 
   useEffect(() => {
-    if (localStorage.accent) applyAccent(localStorage.accent); // restore chosen accent
+    const accent = savedAccent();
+    localStorage.accent = accent; // also migrates the previous flavor palette to Trove's mineral palette
+    applyAccent(accent);
     Queue().then((q) => setQueue(q || []));
     MediaBase().then((b) => { MEDIA_BASE = b; reload(); }); // re-render so media URLs pick up the base
   }, [reload]);
@@ -318,24 +318,24 @@ export default function App() {
   const routeKey = route.kind + ("name" in route ? route.name : "") + ("id" in route ? String(route.id) : "") + ("label" in route ? route.label : ""); // distinct videos (a video tagged to 2 models isn't counted twice)
 
   return (
-    <div className="flex h-full">
+    <div className="trove-app flex h-full">
       {navOpen && <div className="fixed inset-0 z-[45] bg-black/65 backdrop-blur-sm md:hidden" onClick={() => setNavOpen(false)} />}
-      <nav className={`fixed md:static inset-y-0 left-0 z-50 w-72 md:w-56 shrink-0 bg-panel md:bg-panel/90 border-r border-edge flex flex-col overflow-y-auto transition-transform duration-200 rounded-r-3xl md:rounded-none shadow-2xl shadow-black/50 md:shadow-none ${navOpen ? "translate-x-0" : "-translate-x-full"} md:translate-x-0`}
+      <nav className={`trove-sidebar fixed md:static inset-y-0 left-0 z-50 w-72 md:w-60 shrink-0 bg-panel md:bg-panel/90 border-r border-edge flex flex-col overflow-y-auto transition-transform duration-200 rounded-r-3xl md:rounded-none shadow-2xl shadow-black/50 md:shadow-none ${navOpen ? "translate-x-0" : "-translate-x-full"} md:translate-x-0`}
         style={{ paddingTop: "env(safe-area-inset-top)" }}>
-        <div className="px-5 py-6 flex items-center gap-2.5">
-          <Swirl className="w-7 h-7 shrink-0" />
-          <span className="text-lg font-extrabold tracking-tight text-fg">tr<span className="text-accent">o</span>ve</span>
+        <div className="brand-lockup px-5 py-6 flex items-center gap-3">
+          <TroveMark className="w-8 h-8 shrink-0" />
+          <span className="min-w-0"><span className="brand-word block text-[21px] leading-none text-fg">Trove</span><span className="brand-sub block mt-1">Personal archive</span></span>
         </div>
 
-        <SideItem icon="home" active={route.kind === "home"} onClick={() => go({ kind: "home" })}>Home</SideItem>
+        <SideItem icon="home" active={route.kind === "home"} onClick={() => go({ kind: "home" })}>The Trove</SideItem>
         <SideItem icon="grid" active={["videos", "recent", "watched", "favorites", "categories", "category"].includes(route.kind)}
-          onClick={() => go({ kind: "videos" })}>Videos</SideItem>
+          onClick={() => go({ kind: "videos" })}>All finds</SideItem>
         <SideItem icon="people" active={route.kind === "library" || route.kind === "model"} onClick={() => go({ kind: "library" })}>People</SideItem>
-        <SideItem icon="feed" active={route.kind === "feed"} onClick={() => go({ kind: "feed" })}>Feed</SideItem>
+        <SideItem icon="feed" active={route.kind === "feed"} onClick={() => go({ kind: "feed" })}>Discover</SideItem>
 
         <div className="flex items-center justify-between px-5 pt-4 pb-1">
-          <span className="text-[11px] uppercase tracking-wider text-muted/70">Collections</span>
-          <button onClick={() => setNewColl(true)} title="New collection" className="text-muted hover:text-fg text-sm leading-none">＋</button>
+          <span className="text-[11px] uppercase tracking-wider text-muted/70">Your collections</span>
+          <button onClick={() => setNewColl(true)} title="Create a collection" aria-label="Create a collection" className="collection-add text-muted hover:text-fg text-sm leading-none">＋</button>
         </div>
         {collections.length === 0 && <div className="px-5 py-1 text-xs text-muted/60">None yet</div>}
         {collections.map((c, i) => (
@@ -350,14 +350,14 @@ export default function App() {
           </SideItem>
         ))}
 
-        <SideLabel>Manage</SideLabel>
-        <SideItem icon="spark" active={route.kind === "browse"} onClick={() => go({ kind: "browse" })}>Following</SideItem>
+        <SideLabel>Acquire</SideLabel>
+        <SideItem icon="spark" active={route.kind === "browse"} onClick={() => go({ kind: "browse" })}>Sources</SideItem>
         <SideItem icon="download" active={route.kind === "downloads"} onClick={() => go({ kind: "downloads" })}>
-          <span>Downloads {activeDownloads > 0 && <span style={{ color: "var(--ac)" }}>({activeDownloads})</span>}</span>
+          <span>Inbox {activeDownloads > 0 && <span style={{ color: "var(--ac)" }}>({activeDownloads})</span>}</span>
         </SideItem>
         <SideItem icon="gear" active={route.kind === "settings"} onClick={() => go({ kind: "settings" })}>Settings</SideItem>
 
-        <div className="mt-auto px-5 py-4 text-xs text-muted">{totalVideos} videos · {models.length} people</div>
+        <div className="archive-count mt-auto px-5 py-4 text-xs text-muted"><span>{totalVideos}</span> finds <i /> <span>{models.length}</span> people</div>
       </nav>
 
       <main className="flex-1 min-w-0 overflow-y-auto pb-24 md:pb-0">
@@ -468,9 +468,9 @@ function SideLabel({ children }: any) {
 function SideItem({ icon, iconColor, active, onClick, children }: any) {
   return (
     <button onClick={onClick}
-      className={`text-left mx-2 px-3.5 py-2.5 rounded-full text-sm transition flex items-center gap-2.5 ${
+      className={`side-item text-left mx-2 px-3.5 py-2.5 rounded-lg text-sm transition flex items-center gap-2.5 ${
         active
-          ? "bg-accent/20 text-fg font-bold"
+          ? "bg-accent/10 text-fg font-bold"
           : "text-muted font-medium hover:text-fg hover:bg-panel2"
       }`}>
       {icon && (
@@ -491,15 +491,15 @@ function FilterBtn({ on, onClick, children }: any) {
 
 function TopBar({ search, onSearch, onMenu }: { search: string; onSearch: (q: string) => void; onMenu: () => void }) {
   return (
-    <div className="sticky top-0 z-20 glass border-b border-edge/70" style={{ paddingTop: "env(safe-area-inset-top)" }}>
+    <div className="trove-topbar sticky top-0 z-20 glass border-b border-edge/70" style={{ paddingTop: "env(safe-area-inset-top)" }}>
       <div className="flex items-center gap-2 px-3 md:px-6 py-2.5">
         <button onClick={onMenu} aria-label="Open menu"
           className="md:hidden w-10 h-10 shrink-0 grid place-items-center rounded-full text-fg text-2xl leading-none active:bg-panel2">≡</button>
-        <Swirl className="md:hidden w-6 h-6 shrink-0" />
+        <TroveMark className="md:hidden w-7 h-7 shrink-0" />
         <div className="relative flex-1 max-w-2xl mx-auto">
           <Icon name="search" className="w-[18px] h-[18px] absolute left-3.5 top-1/2 -translate-y-1/2 text-muted pointer-events-none" />
           <input value={search} onChange={(e) => onSearch(e.target.value)} enterKeyHint="search"
-            placeholder="Search videos, people, tags, collections…"
+            placeholder="Search your trove…"
             className="w-full bg-panel border border-edge rounded-full pl-10 pr-10 py-2.5 text-sm outline-none focus:border-accent" />
           {search && (
             <button onClick={() => onSearch("")} aria-label="Clear search"
@@ -659,7 +659,10 @@ function VideosPage({ version, modelNames, collections, onPlay, onChanged, onOpe
   return (
     <div className="p-4 md:p-6">
       <div className="flex items-center gap-2.5 mb-2.5">
-        <h1 className="text-xl font-bold">Videos</h1>
+        <div>
+          <div className="eyebrow">Complete catalogue</div>
+          <h1 className="page-title text-xl font-bold">All finds</h1>
+        </div>
         <select value={sort} onChange={(e) => pickSort(e.target.value)} aria-label="Sort"
           className="ml-auto bg-panel border border-edge rounded-lg px-2.5 py-1.5 text-xs text-fg outline-none focus:border-accent">
           {VIDEO_SORTS.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
@@ -751,21 +754,25 @@ function Home({ onPlay, onOpenModel, onGo, version }:
 
   if (loading) return <HomeSkeleton />;
   if (!pool.length && !people.length)
-    return <div className="p-6"><Empty icon="🍦">Nothing here yet — follow someone or add a download and the wall fills itself.</Empty></div>;
+    return (
+      <div className="empty-trove p-6">
+        <Empty icon="◇">Your trove is waiting for its first find. Add a source or bring something into the inbox to begin your collection.</Empty>
+      </div>
+    );
 
   const topPeople = people.filter((p) => p.name).slice(0, 18);
 
   return (
     <div className="pb-10">
-      <div className="px-4 md:px-9 pt-4 md:pt-5 flex items-baseline gap-2.5 flex-wrap">
-        <span className="text-2xl leading-none">{flavorEmoji()}</span>
-        <span className="text-xl font-extrabold tracking-tight text-fg">{greeting()}</span>
-        <span className="text-sm font-semibold text-muted">here's what's fresh.</span>
+      <div className="trove-welcome px-4 md:px-9 pt-5 md:pt-8">
+        <div className="eyebrow"><span>◆</span> Private collection</div>
+        <h1>{greeting()}, curator.</h1>
+        <p>Revisit a favorite or uncover something forgotten.</p>
       </div>
       {hero && <Hero v={hero} onPlay={(v) => onPlay(v, pool)} onShuffle={shuffle} />}
       <div className="mt-6 space-y-8">
         {cont.length > 0 && (
-          <Row title="Continue watching" onSeeAll={() => onGo({ kind: "watched" })}>
+          <Row title="Continue exploring" onSeeAll={() => onGo({ kind: "watched" })}>
             {cont.slice(0, 18).map((v) => (
               <RowCard key={v.site + v.id} v={v}
                 progress={v.position && v.duration ? Math.min(1, v.position / v.duration) : 0}
@@ -775,7 +782,7 @@ function Home({ onPlay, onOpenModel, onGo, version }:
         )}
         {topPeople.length > 0 && (
           <section>
-            <RowHeader title="Top people" onSeeAll={() => onGo({ kind: "library" })} />
+            <RowHeader title="Notable people" onSeeAll={() => onGo({ kind: "library" })} />
             <div className="row flex gap-4 overflow-x-auto px-4 md:px-8 pt-2 pb-3">
               {topPeople.map((p) => (
                 <button key={p.name} onClick={() => onOpenModel(p.name)} className="shrink-0 w-[104px] text-center">
@@ -792,12 +799,12 @@ function Home({ onPlay, onOpenModel, onGo, version }:
           </section>
         )}
         {recent.length > 0 && (
-          <Row title="Newly added" onSeeAll={() => onGo({ kind: "recent" })}>
+          <Row title="Recent discoveries" onSeeAll={() => onGo({ kind: "recent" })}>
             {recent.slice(0, 18).map((v) => <RowCard key={v.site + v.id} v={v} onClick={() => onPlay(v, recent)} />)}
           </Row>
         )}
         {favs.length > 0 && (
-          <Row title="Your favorites" onSeeAll={() => onGo({ kind: "favorites" })}>
+          <Row title="Treasured favorites" onSeeAll={() => onGo({ kind: "favorites" })}>
             {favs.slice(0, 18).map((v) => <RowCard key={v.site + v.id} v={v} onClick={() => onPlay(v, favs)} />)}
           </Row>
         )}
@@ -809,21 +816,21 @@ function Home({ onPlay, onOpenModel, onGo, version }:
 function Hero({ v, onPlay, onShuffle }: { v: Video; onPlay: (v: Video) => void; onShuffle: () => void }) {
   return (
     <div className="px-3 md:px-8 pt-3 md:pt-4">
-      <div className="relative h-[40vh] min-h-[280px] md:h-[52vh] w-full overflow-hidden rounded-blob md:rounded-[2rem] shadow-xl shadow-black/45">
+      <div className="trove-hero relative h-[40vh] min-h-[280px] md:h-[52vh] w-full overflow-hidden rounded-blob shadow-xl shadow-black/45">
         {v.thumbnail
           ? <img src={mediaURL(v.thumbnail)} className="absolute inset-0 w-full h-full object-cover" />
           : <div className="absolute inset-0 bg-panel2" />}
         <div className="hero-scrim" />
         <div className="absolute bottom-0 left-0 right-0 p-5 md:p-10 max-w-3xl">
-          <span className="swirl-chip inline-block text-[10px] uppercase tracking-widest font-extrabold mb-2.5 px-2.5 py-1 rounded-full">Featured</span>
+          <span className="swirl-chip inline-block text-[10px] uppercase tracking-widest font-extrabold mb-2.5 px-2.5 py-1 rounded-full">From the archive</span>
           <h1 className="text-2xl md:text-4xl font-extrabold leading-tight line-clamp-2 cap text-white">{v.title || v.uploader}</h1>
           <div className="text-sm text-white/80 mt-2 cap">
             {v.models && v.models.length ? v.models.map(modelLabel).join(", ") : UNASSIGNED}
             {v.height ? ` · ${v.height}p` : ""}{v.duration ? ` · ${fmtDur(v.duration)}` : ""}
           </div>
           <div className="flex gap-3 mt-5">
-            <button onClick={() => onPlay(v)} className="glow-btn px-6 py-2.5 text-sm flex items-center gap-2">▶ Play</button>
-            <button onClick={onShuffle} className="px-5 py-2.5 text-sm font-semibold rounded-full glass text-fg flex items-center gap-2 hover:bg-panel">⤮ Shuffle</button>
+            <button onClick={() => onPlay(v)} className="glow-btn px-6 py-2.5 text-sm flex items-center gap-2">▶ Open find</button>
+            <button onClick={onShuffle} className="px-5 py-2.5 text-sm font-semibold rounded-full glass text-fg flex items-center gap-2 hover:bg-panel">⤮ Surprise me</button>
           </div>
         </div>
       </div>
@@ -834,8 +841,8 @@ function Hero({ v, onPlay, onShuffle }: { v: Video; onPlay: (v: Video) => void; 
 function RowHeader({ title, onSeeAll }: { title: string; onSeeAll?: () => void }) {
   return (
     <div className="flex items-center justify-between px-4 md:px-8 mb-3">
-      <h2 className="text-lg font-bold tracking-tight flex items-center gap-2">
-        <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />{title}
+      <h2 className="archive-heading text-lg font-bold tracking-tight flex items-center gap-3">
+        <span className="archive-glyph">◆</span>{title}
       </h2>
       {onSeeAll && <button onClick={onSeeAll} className="text-xs text-muted hover:text-fg">See all →</button>}
     </div>
@@ -914,7 +921,7 @@ function ModelGrid({ models, onOpen, onChanged }: { models: Model[]; onOpen: (m:
   const [selectMode, setSelectMode] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
-  if (!models.length) return <Empty icon="🍨">No people yet — download something and they'll show up here.</Empty>;
+  if (!models.length) return <Empty icon="◇">No people catalogued yet. Add something to your inbox and they’ll appear here.</Empty>;
 
   const toggle = (name: string) => setPicked((p) => { const n = new Set(p); n.has(name) ? n.delete(name) : n.add(name); return n; });
   const exit = () => { setSelectMode(false); setPicked(new Set()); };
@@ -1959,10 +1966,10 @@ function BrowseSync({ onEnqueued }: { onEnqueued: () => void }) {
   return (
     <div className="p-4 md:p-6 max-w-4xl">
       <div className="flex items-center gap-3 mb-1">
-        <h1 className="text-xl font-bold">Following</h1>
+        <div><div className="eyebrow">Bring in new finds</div><h1 className="page-title text-xl font-bold">Sources</h1></div>
         {!showList && <button onClick={() => setAdding((a) => !a)} className="ml-auto text-sm font-semibold px-4 py-1.5 glow-btn">{adding ? "Close" : "+ Follow"}</button>}
       </div>
-      <p className="text-sm text-muted mb-4">People, channels, and lists you keep an eye on — open one to see what's new since last time.</p>
+      <p className="text-sm text-muted mb-4">People, channels, and lists you keep an eye on—open a source to uncover what’s new.</p>
 
       {/* Add-a-sync panel */}
       {!showList && adding && (
@@ -1988,7 +1995,7 @@ function BrowseSync({ onEnqueued }: { onEnqueued: () => void }) {
       {/* Saved syncs */}
       {!showList && (
         lists.length === 0
-          ? <Empty icon="✨" action={{ label: "+ Follow someone", onClick: () => setAdding(true) }}>You're not following anything yet. Add a person, channel, or your favorites and trove will keep track of what's new.</Empty>
+          ? <Empty icon="◇" action={{ label: "+ Add a source", onClick: () => setAdding(true) }}>No sources yet. Add a person, channel, or favorites list and Trove will keep watch for new finds.</Empty>
           : (
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill,minmax(240px,1fr))" }}>
               {lists.map((l) => (
@@ -2002,7 +2009,7 @@ function BrowseSync({ onEnqueued }: { onEnqueued: () => void }) {
       {showList && (
         <>
           <div className="flex items-center gap-3 mb-4">
-            <button onClick={back} className="text-muted hover:text-fg text-sm">← Following</button>
+            <button onClick={back} className="text-muted hover:text-fg text-sm">← Sources</button>
             <h2 className="text-lg font-bold truncate">{openTitle}</h2>
           </div>
           {loading && <CardGridSkeleton count={8} ratio="h-12" />}
@@ -2077,7 +2084,7 @@ function SettingsPage() {
   const [rebuilt, setRebuilt] = useState<number | null>(null);
   const [avBusy, setAvBusy] = useState(false);
   const [avProg, setAvProg] = useState<{ done: number; total: number; added: number; name?: string; finished?: boolean } | null>(null);
-  const [accent, setAccent] = useState(localStorage.accent || "236 92 133");
+  const [accent, setAccent] = useState(savedAccent());
   const [conn, setConn] = useState({ x: false, pornhub: false });
   const [autoNext, setAutoNext] = useState(localStorage.autoplayNext !== "0");
   const [hoverPrev, setHoverPrev] = useState(localStorage.hoverPreview !== "0");
@@ -2112,10 +2119,12 @@ function SettingsPage() {
 
   return (
     <div className="p-4 md:p-6 max-w-3xl">
-      <h1 className="text-xl font-semibold mb-6">Settings</h1>
+      <div className="eyebrow">The archive</div>
+      <h1 className="page-title text-xl font-semibold mb-6">Settings</h1>
 
       <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
-        <div className="text-sm font-semibold mb-3">Flavor</div>
+        <div className="text-sm font-semibold mb-1">Signature color</div>
+        <p className="text-xs text-muted mb-4">Choose the mineral accent used on seals, markers, and active controls.</p>
         <div className="flex items-center gap-3">
           {ACCENTS.map((a) => (
             <button key={a.rgb} onClick={() => pickAccent(a.rgb)} title={a.name}
@@ -2124,7 +2133,6 @@ function SettingsPage() {
               {accent === a.rgb && <span className="text-sm font-bold text-white">✓</span>}
             </button>
           ))}
-          <span className="text-xs text-muted ml-1">Pick a flavor — changes the whole app instantly.</span>
         </div>
       </section>
 
@@ -2294,7 +2302,7 @@ function Downloads({ queue }: { queue: Job[] }) {
   return (
     <div className="p-4 md:p-6 max-w-3xl">
       <div className="flex items-baseline gap-3 mb-4">
-        <h1 className="text-xl font-semibold">Downloads</h1>
+        <div><div className="eyebrow">New arrivals</div><h1 className="page-title text-xl font-semibold">Inbox</h1></div>
         {(active || queued) ? <span className="text-sm text-muted">{active} downloading · {queued} queued</span> : null}
       </div>
 
@@ -2306,7 +2314,7 @@ function Downloads({ queue }: { queue: Job[] }) {
             className="flex-1 bg-panel2 border border-edge rounded-lg px-4 py-2.5 text-sm outline-none focus:border-accent" />
           <button onClick={add} className="glow-btn px-6 rounded-lg">Add</button>
         </div>
-        <p className="text-xs text-muted mt-2">A single video from Pornhub, X/Twitter, and many other sites. For a whole person or your favorites, use <b>Following</b>. Private posts need an account connected in <b>Settings</b>.</p>
+        <p className="text-xs text-muted mt-2">A single video from Pornhub, X/Twitter, and many other sites. For a whole person or your favorites, use <b>Sources</b>. Private posts need an account connected in <b>Settings</b>.</p>
       </section>
 
       <section className="bg-panel border border-edge rounded-xl p-5 mb-6">
@@ -2325,7 +2333,7 @@ function Downloads({ queue }: { queue: Job[] }) {
         <h2 className="font-semibold">Queue {queue.length > 0 && <span className="text-muted font-normal text-sm">· {queue.length}</span>}</h2>
         {finished > 0 && <button onClick={() => ClearFinished()} className="text-xs text-muted hover:text-fg">Clear finished ({finished})</button>}
       </div>
-      {queue.length === 0 ? <Empty icon="🥄">Nothing queued. Paste a URL above, or open Following to pull everything from someone you like.</Empty>
+      {queue.length === 0 ? <Empty icon="◇">The inbox is empty. Paste a URL above, or open Sources to bring new finds into your trove.</Empty>
         : <div className="space-y-2">{queue.map((j) => <QueueItem key={j.id} j={j} />)}</div>}
     </div>
   );
@@ -2729,10 +2737,10 @@ function FeedItem({ v, index, active, near, muted, preload, avatar, models, onVi
 function TabBar({ route, onGo }:
   { route: Route; onGo: (r: Route) => void }) {
   const tabs = [
-    { key: "home", label: "Home", icon: "home", active: route.kind === "home", onClick: () => onGo({ kind: "home" }) },
-    { key: "videos", label: "Videos", icon: "grid", active: ["videos", "recent", "watched", "favorites", "categories", "category"].includes(route.kind), onClick: () => onGo({ kind: "videos" }) },
+    { key: "home", label: "Trove", icon: "home", active: route.kind === "home", onClick: () => onGo({ kind: "home" }) },
+    { key: "videos", label: "Finds", icon: "grid", active: ["videos", "recent", "watched", "favorites", "categories", "category"].includes(route.kind), onClick: () => onGo({ kind: "videos" }) },
     { key: "library", label: "People", icon: "people", active: route.kind === "library" || route.kind === "model", onClick: () => onGo({ kind: "library" }) },
-    { key: "feed", label: "Feed", icon: "feed", active: route.kind === "feed", onClick: () => onGo({ kind: "feed" }) },
+    { key: "feed", label: "Discover", icon: "feed", active: route.kind === "feed", onClick: () => onGo({ kind: "feed" }) },
   ];
   return (
     <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 flex glass border-t border-edge/70"

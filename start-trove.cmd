@@ -17,7 +17,7 @@ if not defined LANIP for /f %%i in ('powershell -NoProfile -Command "(Get-NetIPA
 
 echo.
 echo   ============================================================
-echo     trove is starting
+echo     Trove is starting
 echo.
 echo     On this PC:      http://localhost:%PORT%
 if defined LANIP (

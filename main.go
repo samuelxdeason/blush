@@ -17,7 +17,7 @@ func main() {
 
 	// Create application with options
 	err := wails.Run(&options.App{
-		Title:     "trove",
+		Title:     "Trove",
 		Width:     1280,
 		Height:    860,
 		MinWidth:  900,
@@ -26,7 +26,7 @@ func main() {
 			Assets: assets, // the web UI; data/media/events go to the in-process server (App.APIBase)
 		},
 		DragAndDrop: &options.DragAndDrop{EnableFileDrop: true},
-		BackgroundColour: &options.RGBA{R: 19, G: 17, B: 24, A: 1}, // plum-charcoal, matches the yogurt theme
+		BackgroundColour: &options.RGBA{R: 17, G: 20, B: 17, A: 1},
 		OnStartup:        app.startup,
 		Bind: []interface{}{
 			app,

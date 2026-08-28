@@ -1,13 +1,13 @@
 {
-  "name": "trove",
-  "short_name": "trove",
-  "description": "Your private, self-hosted media library.",
+  "name": "Trove",
+  "short_name": "Trove",
+  "description": "A private collection of valuable, interesting finds.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#131118",
-  "theme_color": "#131118",
+  "background_color": "#111411",
+  "theme_color": "#111411",
   "icons": [
     { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
     { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },

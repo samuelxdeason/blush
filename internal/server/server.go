@@ -126,6 +126,32 @@ func (s *Server) routes(ui fs.FS) {
 	post(m, "/api/savemodelinfo", func(b body) (any, error) { return ok, s.core.SaveModelInfo(b.Name, b.Nickname, b.Bio, b.Links) })
 	post(m, "/api/model/rename", func(b body) (any, error) { return ok, s.core.RenameModel(b.Name, b.NewName) })
 	post(m, "/api/photos/from-url", func(b body) (any, error) { s.core.ImportPhotosFromURL(b.URL, b.Model, b.Name); return ok, nil })
+
+	// --- ingestion (external fetcher catalogues files it placed in the vault) ---
+	m.HandleFunc("POST /api/ingest/video", func(w http.ResponseWriter, r *http.Request) {
+		var v library.Video
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&v); err != nil || v.ID == "" || v.Site == "" {
+			http.Error(w, "bad video payload", http.StatusBadRequest)
+			return
+		}
+		if err := s.core.UpsertVideo(v); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ok)
+	})
+	m.HandleFunc("POST /api/ingest/photo", func(w http.ResponseWriter, r *http.Request) {
+		var p library.Photo
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&p); err != nil || p.ID == "" {
+			http.Error(w, "bad photo payload", http.StatusBadRequest)
+			return
+		}
+		if err := s.core.AddPhoto(p); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ok)
+	})
 	post(m, "/api/setmodelcover", func(b body) (any, error) { return ok, s.core.SetModelCover(b.Name, b.Cover) })
 	post(m, "/api/avatar/url", func(b body) (any, error) { return ok, s.core.SetAvatarFromURL(b.Name, b.URL) })
 	post(m, "/api/avatar/fetch", func(b body) (any, error) { set, err := s.core.FetchAvatarFor(b.Name); return map[string]bool{"set": set}, err })

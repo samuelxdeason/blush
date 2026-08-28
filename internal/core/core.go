@@ -212,6 +212,22 @@ func copyFileCore(src, dst string) error {
 	return err
 }
 
+// ---- ingestion (for the external fetcher) -------------------------------
+
+// UpsertVideo catalogues a video that an external tool (trove-fetch) has
+// already placed in the vault. Paths may be absolute; they are stored
+// relative to the media root.
+func (c *Core) UpsertVideo(v library.Video) error {
+	err := c.db.Upsert(v)
+	if err == nil {
+		c.emit("library", map[string]any{"site": v.Site, "id": v.ID})
+	}
+	return err
+}
+
+// AddPhoto catalogues a photo an external tool has placed in the vault.
+func (c *Core) AddPhoto(p library.Photo) error { return c.db.AddPhoto(p) }
+
 // RebuildFromDisk re-catalogues the vault by scanning media + .info.json sidecars.
 // It restores the library if the DB is lost and re-points filepaths after files
 // are moved, without discarding user data (models/favorites/labels survive).
