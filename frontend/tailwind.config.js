@@ -4,14 +4,14 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Trove: archival charcoal, warm vellum and a changeable mineral accent.
-        ink: "#111411",
-        panel: "#191D19",
-        panel2: "#222822",
-        edge: "#343C34",
-        muted: "#9CA49A",
-        fg: "#F3EFE4",
-        noir: "#090B09",
+        // Trove: a clean launcher-like dark system with one vivid mood color.
+        ink: "#0F0F11",
+        panel: "#18181C",
+        panel2: "#222228",
+        edge: "#303037",
+        muted: "#9B9BA4",
+        fg: "#F7F7F8",
+        noir: "#08080A",
         accent: "rgb(var(--ac-rgb) / <alpha-value>)",
         acink: "var(--ac-ink)", // readable text on the accent
       },
